@@ -1,6 +1,7 @@
 import SwiftUI
 import simd
 import LegoDrawFile
+import LDrawGLES
 
 @MainActor
 final class PlaygroundModel: ObservableObject {

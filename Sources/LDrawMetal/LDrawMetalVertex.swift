@@ -1,3 +1,4 @@
+#if canImport(Metal)
 import simd
 import LegoDrawFile
 
@@ -14,3 +15,4 @@ public struct LDrawMetalVertex {
         self.color = color
     }
 }
+#endif

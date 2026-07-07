@@ -40,7 +40,8 @@ let package = Package(
         .executableTarget(
             name: "LDrawPlayground",
             dependencies: [
-                .product(name: "LegoDrawFile", package: "swift-lego-draw")
+                .product(name: "LegoDrawFile", package: "swift-lego-draw"),
+                .product(name: "LDrawGLES", package: "swift-lego-draw")
             ],
             resources: [
                 .copy("ldraw")

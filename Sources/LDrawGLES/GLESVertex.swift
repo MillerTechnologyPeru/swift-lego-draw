@@ -2,25 +2,25 @@ import simd
 import LegoDrawFile
 
 /// Packed vertex for OpenGL ES — no SIMD alignment padding, stride = 40 bytes.
-struct GLESVertex {
-    var px, py, pz: Float   // position  (offset  0)
-    var nx, ny, nz: Float   // normal    (offset 12)
-    var r, g, b, a: Float   // color     (offset 24)
+public struct GLESVertex: Sendable {
+    public var px, py, pz: Float   // position  (offset  0)
+    public var nx, ny, nz: Float   // normal    (offset 12)
+    public var r, g, b, a: Float   // color     (offset 24)
 }
 
 /// Walks a ``ResolvedLDrawModel`` and emits a flat ``[GLESVertex]`` array
 /// (every 3 vertices = one triangle) for upload to an OpenGL ES VBO.
-struct LDrawGLESFlattener {
+public struct LDrawGLESFlattener {
 
     private let colorTable: LDrawColorTable
     private let defaultColor: LDrawResolvedColor
 
-    init(colorTable: LDrawColorTable, defaultColor: LDrawResolvedColor) {
+    public init(colorTable: LDrawColorTable, defaultColor: LDrawResolvedColor) {
         self.colorTable = colorTable
         self.defaultColor = defaultColor
     }
 
-    func flatten(_ model: ResolvedLDrawModel) -> [GLESVertex] {
+    public func flatten(_ model: ResolvedLDrawModel) -> [GLESVertex] {
         var vertices: [GLESVertex] = []
         visit(model, transform: matrix_identity_float4x4,
               inheritedColor: defaultColor, ccw: model.bfcState.windingIsCCW, &vertices)

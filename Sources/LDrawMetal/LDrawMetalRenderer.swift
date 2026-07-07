@@ -1,3 +1,4 @@
+#if canImport(Metal)
 import Metal
 import MetalKit
 import simd
@@ -185,3 +186,4 @@ private func perspectiveFov(fovY: Float, aspect: Float, near: Float, far: Float)
         SIMD4<Float>(0, 0,  z * near, 0)
     ))
 }
+#endif

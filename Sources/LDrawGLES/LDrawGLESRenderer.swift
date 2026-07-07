@@ -1,5 +1,10 @@
-import GLKit
+#if os(iOS) || os(tvOS) || os(Linux)
+
+#if canImport(OpenGLES)
 import OpenGLES
+#elseif canImport(CGLES2)
+import CGLES2
+#endif
 import simd
 
 // MARK: - Shaders
@@ -42,17 +47,25 @@ void main() {
 
 // MARK: - Renderer
 
-/// OpenGL ES 2.0 renderer that draws a pre-built vertex buffer via GLKView.
-final class OpenGLESRenderer: NSObject, GLKViewDelegate {
+/// OpenGL ES 2.0 renderer that draws a pre-built vertex buffer.
+///
+/// This class contains no platform-specific windowing or context-management
+/// code — it only issues `gl*` calls, which are identical between Apple's
+/// `OpenGLES` framework (iOS/tvOS) and Linux's `libGLESv2` (via the `CGLES2`
+/// system-library shim). Context creation/lifetime and buffer presentation
+/// are delegated to a ``GLESRenderingContext`` supplied by the caller —
+/// ``EAGLRenderingContext`` on Apple platforms, ``EGLRenderingContext`` on
+/// Linux.
+public final class LDrawGLESRenderer {
 
     // MARK: - Camera (set externally)
-    var azimuth: Float = 0
-    var elevation: Float = 0.4
-    var distance: Float = 100
-    var modelCenter = SIMD3<Float>.zero
-    var modelRadius: Float = 50
+    public var azimuth: Float = 0
+    public var elevation: Float = 0.4
+    public var distance: Float = 100
+    public var modelCenter = SIMD3<Float>.zero
+    public var modelRadius: Float = 50
 
-    let context: EAGLContext
+    private let context: any GLESRenderingContext
     private var program: GLuint = 0
     private var vbo: GLuint = 0
     private var vertexCount: Int = 0
@@ -66,10 +79,9 @@ final class OpenGLESRenderer: NSObject, GLKViewDelegate {
     private let normalAttr:   GLuint = 1
     private let colorAttr:    GLuint = 2
 
-    init?(context: EAGLContext) {
+    public init?(context: any GLESRenderingContext) {
         self.context = context
-        super.init()
-        EAGLContext.setCurrent(context)
+        context.makeCurrent()
         guard setupShaders() else { return nil }
         glEnable(GLenum(GL_DEPTH_TEST))
         glDepthFunc(GLenum(GL_LESS))
@@ -79,15 +91,15 @@ final class OpenGLESRenderer: NSObject, GLKViewDelegate {
     }
 
     deinit {
-        EAGLContext.setCurrent(context)
+        context.makeCurrent()
         if vbo != 0 { glDeleteBuffers(1, &vbo) }
         if program != 0 { glDeleteProgram(program) }
     }
 
     // MARK: - Upload
 
-    func upload(vertices: [GLESVertex]) {
-        EAGLContext.setCurrent(context)
+    public func upload(vertices: [GLESVertex]) {
+        context.makeCurrent()
         vertexCount = vertices.count
         if vbo == 0 { glGenBuffers(1, &vbo) }
         glBindBuffer(GLenum(GL_ARRAY_BUFFER), vbo)
@@ -96,15 +108,23 @@ final class OpenGLESRenderer: NSObject, GLKViewDelegate {
         glBindBuffer(GLenum(GL_ARRAY_BUFFER), 0)
     }
 
-    // MARK: - GLKViewDelegate
+    // MARK: - Draw
 
-    func glkView(_ view: GLKView, drawIn rect: CGRect) {
-        guard vertexCount > 0 else { return }
+    /// Renders one frame at the given viewport aspect ratio (width / height)
+    /// and presents it. The caller is responsible for calling this once per
+    /// frame — e.g. from a `CADisplayLink` callback on Apple platforms, or
+    /// from a render loop driving an EGL surface on Linux.
+    public func draw(aspect: Float) {
+        context.makeCurrent()
+        guard vertexCount > 0 else {
+            glClear(GLbitfield(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT))
+            context.swapBuffers()
+            return
+        }
 
         glClear(GLbitfield(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT))
         glUseProgram(program)
 
-        let aspect = Float(rect.width / rect.height)
         let (mvp, normalMat) = buildMatrices(aspect: aspect)
 
         withUnsafeBytes(of: mvp) { ptr in
@@ -137,6 +157,8 @@ final class OpenGLESRenderer: NSObject, GLKViewDelegate {
         glDisableVertexAttribArray(normalAttr)
         glDisableVertexAttribArray(colorAttr)
         glBindBuffer(GLenum(GL_ARRAY_BUFFER), 0)
+
+        context.swapBuffers()
     }
 
     // MARK: - Camera math
@@ -202,8 +224,10 @@ final class OpenGLESRenderer: NSObject, GLKViewDelegate {
 
     private func compile(src: String, type: GLenum) -> GLuint? {
         let shader = glCreateShader(type)
-        var cSrc = (src as NSString).utf8String
-        glShaderSource(shader, 1, &cSrc, nil)
+        src.withCString { cStr in
+            var mutableCStr: UnsafePointer<GLchar>? = cStr
+            glShaderSource(shader, 1, &mutableCStr, nil)
+        }
         glCompileShader(shader)
         var status: GLint = 0
         glGetShaderiv(shader, GLenum(GL_COMPILE_STATUS), &status)
@@ -243,3 +267,5 @@ private func perspectiveFov(fovY: Float, aspect: Float, near: Float, far: Float)
         SIMD4<Float>(0, 0,  z * near, 0)
     ))
 }
+
+#endif

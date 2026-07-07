@@ -1,20 +1,24 @@
 import SwiftUI
 import GLKit
+import LDrawGLES
 
-/// UIViewController that owns the EAGLContext, GLKView, and CADisplayLink.
-/// CADisplayLink calls `glkView.display()` each vsync, which triggers
-/// `renderer.glkView(_:drawIn:)`.
-final class GLKHostViewController: UIViewController {
+/// UIViewController that owns the ``EAGLRenderingContext``, `GLKView`, and
+/// `CADisplayLink`. The display link calls `glkView.display()` each vsync,
+/// which invokes `glkView(_:drawIn:)` below — that in turn calls the
+/// platform-agnostic ``LDrawGLESRenderer/draw(aspect:)``.
+final class GLKHostViewController: UIViewController, GLKViewDelegate {
 
-    let renderer: OpenGLESRenderer
+    let eaglContext: EAGLRenderingContext
+    let renderer: LDrawGLESRenderer
     private var glkView: GLKView!
     private var displayLink: CADisplayLink?
 
     init() {
         guard
-            let ctx = EAGLContext(api: .openGLES2),
-            let r = OpenGLESRenderer(context: ctx)
+            let ctx = EAGLRenderingContext(),
+            let r = LDrawGLESRenderer(context: ctx)
         else { fatalError("OpenGL ES 2.0 unavailable") }
+        self.eaglContext = ctx
         self.renderer = r
         super.init(nibName: nil, bundle: nil)
     }
@@ -22,10 +26,10 @@ final class GLKHostViewController: UIViewController {
     required init?(coder: NSCoder) { fatalError() }
 
     override func loadView() {
-        glkView = GLKView(frame: .zero, context: renderer.context)
+        glkView = GLKView(frame: .zero, context: eaglContext.eaglContext)
         glkView.drawableDepthFormat = .format24
         glkView.enableSetNeedsDisplay = false
-        glkView.delegate = renderer
+        glkView.delegate = self
         view = glkView
 
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan))
@@ -47,6 +51,15 @@ final class GLKHostViewController: UIViewController {
     }
 
     @objc private func render() { glkView.display() }
+
+    // MARK: - GLKViewDelegate
+
+    nonisolated func glkView(_ view: GLKView, drawIn rect: CGRect) {
+        MainActor.assumeIsolated {
+            let aspect = Float(rect.width / rect.height)
+            renderer.draw(aspect: aspect)
+        }
+    }
 
     // MARK: - Gestures
 
