@@ -11,6 +11,7 @@ let package = Package(
     products: [
         .library(name: "LegoDrawFile", targets: ["LegoDrawFile"]),
         .library(name: "LDrawSceneKit", targets: ["LDrawSceneKit"]),
+        .library(name: "LDrawMetal", targets: ["LDrawMetal"]),
     ],
     targets: [
         .target(
@@ -22,10 +23,20 @@ let package = Package(
             dependencies: ["LegoDrawFile"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .target(
+            name: "LDrawMetal",
+            dependencies: ["LegoDrawFile"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .executableTarget(
             name: "RenderLDrawModel",
             dependencies: ["LDrawSceneKit"],
             path: "Examples/RenderLDrawModel"
+        ),
+        .executableTarget(
+            name: "MetalLDrawViewer",
+            dependencies: ["LDrawMetal"],
+            path: "Examples/MetalLDrawViewer"
         ),
         .testTarget(
             name: "LegoDrawFileTests",
