@@ -18,7 +18,17 @@ public final class LDrawVulkanContext {
     public let graphicsQueueFamilyIndex: UInt32
     public let commandPool: VkCommandPool
 
-    public init?(applicationName: String = "LDrawVulkan", enableValidation: Bool = false) {
+    /// - Parameters:
+    ///   - instanceExtensions: Extra `VK_KHR_*` instance extensions to request, e.g.
+    ///     `["VK_KHR_surface", "VK_KHR_android_surface"]` for on-screen rendering. The headless
+    ///     offscreen renderer needs none of these.
+    ///   - deviceExtensions: Extra device extensions to request, e.g. `["VK_KHR_swapchain"]`.
+    public init?(
+        applicationName: String = "LDrawVulkan",
+        enableValidation: Bool = false,
+        instanceExtensions: [String] = [],
+        deviceExtensions: [String] = []
+    ) {
         // MARK: Instance
         let applicationNameC = strdup(applicationName)
         let engineNameC = strdup("LDrawVulkan")
@@ -34,16 +44,23 @@ public final class LDrawVulkanContext {
         // (variant << 29) | (major << 22) | (minor << 12) | patch, i.e. variant 0, major 1.
         appInfo.apiVersion = UInt32(1) << 22
 
+        let instanceExtensionCStrings = instanceExtensions.map { strdup($0) }
         var instanceCreateInfo = VkInstanceCreateInfo()
         instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
         var appInfoLocal = appInfo
         var createdInstance: VkInstance? = nil
+        var instanceExtensionPointers = instanceExtensionCStrings.map { UnsafePointer($0) }
         let instanceResult = withUnsafePointer(to: &appInfoLocal) { appInfoPtr -> VkResult in
             instanceCreateInfo.pApplicationInfo = appInfoPtr
-            return vkCreateInstance(&instanceCreateInfo, nil, &createdInstance)
+            return instanceExtensionPointers.withUnsafeMutableBufferPointer { extPtr -> VkResult in
+                instanceCreateInfo.enabledExtensionCount = UInt32(extPtr.count)
+                instanceCreateInfo.ppEnabledExtensionNames = UnsafePointer(extPtr.baseAddress)
+                return vkCreateInstance(&instanceCreateInfo, nil, &createdInstance)
+            }
         }
         free(applicationNameC)
         free(engineNameC)
+        instanceExtensionCStrings.forEach { free($0) }
         guard instanceResult == VK_SUCCESS, let instance = createdInstance else { return nil }
         self.instance = instance
 
@@ -81,6 +98,8 @@ public final class LDrawVulkanContext {
 
         // MARK: Logical device + queue
         var queuePriority: Float = 1.0
+        let deviceExtensionCStrings = deviceExtensions.map { strdup($0) }
+        var deviceExtensionPointers = deviceExtensionCStrings.map { UnsafePointer($0) }
         var createdDevice: VkDevice? = nil
         let deviceResult: VkResult = withUnsafePointer(to: &queuePriority) { priorityPtr -> VkResult in
             var queueCreateInfo = VkDeviceQueueCreateInfo()
@@ -90,13 +109,18 @@ public final class LDrawVulkanContext {
             queueCreateInfo.pQueuePriorities = priorityPtr
 
             return withUnsafePointer(to: &queueCreateInfo) { queueInfoPtr -> VkResult in
-                var deviceCreateInfo = VkDeviceCreateInfo()
-                deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
-                deviceCreateInfo.queueCreateInfoCount = 1
-                deviceCreateInfo.pQueueCreateInfos = queueInfoPtr
-                return vkCreateDevice(physicalDevice, &deviceCreateInfo, nil, &createdDevice)
+                deviceExtensionPointers.withUnsafeMutableBufferPointer { extPtr -> VkResult in
+                    var deviceCreateInfo = VkDeviceCreateInfo()
+                    deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+                    deviceCreateInfo.queueCreateInfoCount = 1
+                    deviceCreateInfo.pQueueCreateInfos = queueInfoPtr
+                    deviceCreateInfo.enabledExtensionCount = UInt32(extPtr.count)
+                    deviceCreateInfo.ppEnabledExtensionNames = UnsafePointer(extPtr.baseAddress)
+                    return vkCreateDevice(physicalDevice, &deviceCreateInfo, nil, &createdDevice)
+                }
             }
         }
+        deviceExtensionCStrings.forEach { free($0) }
         guard deviceResult == VK_SUCCESS, let device = createdDevice else { return nil }
         self.device = device
 

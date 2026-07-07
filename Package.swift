@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "LDrawMetal", targets: ["LDrawMetal"]),
         .library(name: "LDrawGLES", targets: ["LDrawGLES"]),
         .library(name: "LDrawVulkan", targets: ["LDrawVulkan"]),
+        .library(name: "CVulkan", targets: ["CVulkan"]),
     ],
     targets: [
         .target(

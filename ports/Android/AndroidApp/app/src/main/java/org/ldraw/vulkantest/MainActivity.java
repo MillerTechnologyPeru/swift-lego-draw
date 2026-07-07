@@ -3,10 +3,9 @@ package org.ldraw.vulkantest;
 import android.app.Activity;
 import android.content.res.AssetManager;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
-import android.util.Log;
-import android.widget.TextView;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -16,55 +15,59 @@ import java.io.OutputStream;
 
 /**
  * Loads libLDrawVulkanAndroid.so (built by the sibling Swift package, staged into
- * src/main/jniLibs/ by scripts/stage-jnilibs.sh), extracts the bundled LDraw test model from the
- * APK's assets/ to internal storage (the NDK's AAssetManager isn't a plain filesystem path, but
- * the Swift side just wants a directory it can read with String(contentsOf:)), then calls the
- * exported {@code runVulkanTest} native method on a background thread — it runs a real Vulkan
- * render + GPU readback, so it must not block the UI thread.
+ * src/main/jniLibs/ by scripts/stage-jnilibs.sh), extracts the bundled LDraw test model + compiled
+ * SPIR-V shaders from the APK's assets/ to internal storage, then forwards this SurfaceView's
+ * lifecycle to the native side: {@code nativeSurfaceCreated} wraps the {@link Surface} in an
+ * {@code ANativeWindow}, builds a Vulkan swapchain against it, and starts a background render
+ * loop that spins the model — no windowing/graphics work happens in Java at all.
  */
-public class MainActivity extends Activity {
-    private static final String TAG = "LDrawVulkanTest";
-
+public class MainActivity extends Activity implements SurfaceHolder.Callback {
     static {
         System.loadLibrary("LDrawVulkanAndroid");
     }
 
-    private native String runVulkanTest(String assetDir, String outputPath, int width, int height);
+    private native void nativeSurfaceCreated(
+        Surface surface, String assetDir, String shaderDir, int width, int height);
+    private native void nativeSurfaceDestroyed();
+
+    private String ldrawDir;
+    private String shaderDir;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main);
 
-        TextView statusText = findViewById(R.id.statusText);
-        Handler mainHandler = new Handler(Looper.getMainLooper());
+        SurfaceView surfaceView = new SurfaceView(this);
+        setContentView(surfaceView);
+        surfaceView.getHolder().addCallback(this);
 
-        new Thread(() -> {
-            String resultMessage;
-            try {
-                String assetDir = extractBundledAssets();
-                String outputPath = new File(getFilesDir(), "output.ppm").getAbsolutePath();
-                resultMessage = runVulkanTest(assetDir, outputPath, 800, 600);
-            } catch (IOException e) {
-                resultMessage = "FAIL: asset extraction error: " + e;
-            }
-            Log.i(TAG, resultMessage);
-            String finalMessage = resultMessage;
-            mainHandler.post(() -> statusText.setText(finalMessage));
-        }).start();
+        try {
+            AssetManager assets = getAssets();
+            File ldraw = new File(getFilesDir(), "ldraw");
+            File shaders = new File(getFilesDir(), "shaders");
+            copyAssetTree(assets, "ldraw", ldraw);
+            copyAssetTree(assets, "shaders", shaders);
+            ldrawDir = ldraw.getAbsolutePath();
+            shaderDir = shaders.getAbsolutePath();
+        } catch (IOException e) {
+            throw new RuntimeException("failed to extract bundled assets", e);
+        }
     }
 
-    /**
-     * Copies assets/ldraw/** (the 2x4 brick + its stud/box primitives — same files the iOS
-     * playground bundles) into {@code <internal storage>/ldraw/}, returning that directory's
-     * path. Runs on every launch; the model is a handful of tiny text files so re-copying is
-     * effectively free.
-     */
-    private String extractBundledAssets() throws IOException {
-        File destRoot = new File(getFilesDir(), "ldraw");
-        AssetManager assets = getAssets();
-        copyAssetTree(assets, "ldraw", destRoot);
-        return destRoot.getAbsolutePath();
+    @Override
+    public void surfaceCreated(SurfaceHolder holder) {
+        // Real width/height come in via surfaceChanged, immediately after this — swapchain
+        // creation there has valid dimensions to work with.
+    }
+
+    @Override
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        nativeSurfaceCreated(holder.getSurface(), ldrawDir, shaderDir, width, height);
+    }
+
+    @Override
+    public void surfaceDestroyed(SurfaceHolder holder) {
+        nativeSurfaceDestroyed();
     }
 
     private void copyAssetTree(AssetManager assets, String assetPath, File dest) throws IOException {

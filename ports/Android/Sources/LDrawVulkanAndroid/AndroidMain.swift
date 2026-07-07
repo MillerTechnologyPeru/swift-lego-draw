@@ -1,37 +1,164 @@
-// Android entry point for the headless Vulkan renderer test.
+// Android entry point for the on-screen, spinning Vulkan demo.
 //
-// Lifecycle: MainActivity (a plain Activity, see AndroidApp/) extracts the bundled LDraw asset
-// files from the APK to internal storage in Java, then calls the exported native method below
-// directly (no SDL, no on-screen rendering surface — LDrawVulkanOffscreenRenderer renders into
-// an off-screen image and reads it back to host memory, so there's nothing to present).
+// Lifecycle: MainActivity (a SurfaceView-backed Activity, see AndroidApp/) extracts the bundled
+// LDraw asset files + compiled shaders from the APK to internal storage in Java, then forwards
+// its SurfaceHolder callbacks (surfaceCreated/surfaceDestroyed) to the native methods below.
+// `nativeSurfaceCreated` wraps the Java `Surface` in an `ANativeWindow`, creates a Vulkan
+// instance/device/swapchain against it, and starts a background render loop that spins the
+// model — the Vulkan equivalent of the OpenGL ES playground's `CADisplayLink`-driven auto-rotate.
 
 import Foundation
 import CJNI
+import CVulkan
 import LegoDrawFile
 import LDrawVulkan
 
-/// The symbol Java's `MainActivity.runVulkanTest` native-method declaration resolves to (JNI
-/// name mangling: package dots -> underscores, then `_ClassName_methodName`).
-/// Signature: `private native String runVulkanTest(String assetDir, String outputPath, int width, int height);`
-@_cdecl("Java_org_ldraw_vulkantest_MainActivity_runVulkanTest")
-public func runVulkanTest(
+private let logger = AndroidLog(tag: "LDrawVulkanTest")
+
+// MARK: - JNI entry points
+
+/// Signature: `private native void nativeSurfaceCreated(Surface surface, String assetDir, String shaderDir, int width, int height);`
+@_cdecl("Java_org_ldraw_vulkantest_MainActivity_nativeSurfaceCreated")
+public func nativeSurfaceCreated(
     _ env: UnsafeMutablePointer<JNIEnv?>,
     _ thiz: jobject,
+    _ surface: jobject?,
     _ assetDirJString: jstring?,
-    _ outputPathJString: jstring?,
+    _ shaderDirJString: jstring?,
     _ width: jint,
     _ height: jint
-) -> jstring? {
+) {
+    guard let surface, let nativeWindow = ANativeWindow_fromSurface(env, surface) else {
+        logger.error("nativeSurfaceCreated: no ANativeWindow")
+        return
+    }
     let assetDir = jstringToString(env, assetDirJString) ?? ""
-    let outputPath = jstringToString(env, outputPathJString) ?? "/data/local/tmp/ldraw-vulkan-test.ppm"
-
-    let result = runTest(assetDir: assetDir, outputPath: outputPath, width: Int(width), height: Int(height))
-    return stringToJString(env, result)
+    let shaderDir = jstringToString(env, shaderDirJString) ?? ""
+    RenderSession.start(nativeWindow: nativeWindow, assetDir: assetDir, shaderDir: shaderDir, width: Int(width), height: Int(height))
 }
 
-// MARK: - Test body
+/// Signature: `private native void nativeSurfaceDestroyed();`
+@_cdecl("Java_org_ldraw_vulkantest_MainActivity_nativeSurfaceDestroyed")
+public func nativeSurfaceDestroyed(_ env: UnsafeMutablePointer<JNIEnv?>, _ thiz: jobject) {
+    RenderSession.stop()
+}
 
-private func runTest(assetDir: String, outputPath: String, width: Int, height: Int) -> String {
+// MARK: - Render session
+
+/// Owns the Vulkan instance/device/swapchain for the lifetime of the Activity's `Surface`, and
+/// drives a background thread that spins the model and presents a frame every ~16ms. One session
+/// at a time — `start` tears down any previous session first (handles the emulator/device
+/// occasionally re-creating the surface without an intervening destroy).
+private final class RenderSession: @unchecked Sendable {
+    // Only ever touched from the JVM thread that calls the JNI entry points below (Java's
+    // SurfaceHolder callbacks are always delivered serially on the same thread), so a plain
+    // global is safe despite not being provably so to the compiler.
+    nonisolated(unsafe) static var current: RenderSession?
+
+    private let nativeWindow: OpaquePointer
+    // var + explicitly niled (not left to ARC) so requestStop() can force teardown order:
+    // renderer must destroy its swapchain before we destroy the VkSurfaceKHR it was built from,
+    // and the context (device/instance) must outlive both.
+    private var context: LDrawVulkanContext!
+    private var renderer: LDrawVulkanSwapchainRenderer!
+    private let surface: VkSurfaceKHR
+    private var thread: Thread?
+    private let stateLock = NSLock()
+    private var shouldStop = false
+
+    static func start(nativeWindow: OpaquePointer, assetDir: String, shaderDir: String, width: Int, height: Int) {
+        stop()
+        guard let session = RenderSession(nativeWindow: nativeWindow, assetDir: assetDir, shaderDir: shaderDir, width: width, height: height) else {
+            logger.error("RenderSession: setup failed")
+            ANativeWindow_release(nativeWindow)
+            return
+        }
+        current = session
+        session.startLoop()
+    }
+
+    static func stop() {
+        current?.requestStop()
+        current = nil
+    }
+
+    private init?(nativeWindow: OpaquePointer, assetDir: String, shaderDir: String, width: Int, height: Int) {
+        self.nativeWindow = nativeWindow
+
+        guard let context = LDrawVulkanContext(
+            instanceExtensions: ["VK_KHR_surface", "VK_KHR_android_surface"],
+            deviceExtensions: ["VK_KHR_swapchain"]
+        ) else {
+            logger.error("Vulkan instance/device creation failed")
+            return nil
+        }
+        self.context = context
+
+        var surfaceCreateInfo = VkAndroidSurfaceCreateInfoKHR()
+        surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR
+        surfaceCreateInfo.window = nativeWindow
+        var createdSurface: VkSurfaceKHR? = nil
+        guard vkCreateAndroidSurfaceKHR(context.instance, &surfaceCreateInfo, nil, &createdSurface) == VK_SUCCESS,
+              let createdSurface
+        else {
+            logger.error("vkCreateAndroidSurfaceKHR failed")
+            return nil
+        }
+        self.surface = createdSurface
+
+        guard let renderer = LDrawVulkanSwapchainRenderer(
+            context: context, surface: createdSurface, width: width, height: height,
+            shaderDirectory: URL(fileURLWithPath: shaderDir, isDirectory: true)
+        ) else {
+            logger.error("LDrawVulkanSwapchainRenderer creation failed (missing compiled .spv shaders?)")
+            return nil
+        }
+        self.renderer = renderer
+
+        loadModel(assetDir: assetDir, into: renderer)
+    }
+
+    private func startLoop() {
+        let t = Thread { [self] in
+            while true {
+                stateLock.lock()
+                let stop = shouldStop
+                stateLock.unlock()
+                if stop { break }
+
+                renderer.azimuth += 0.01
+                renderer.drawFrame()
+                Thread.sleep(forTimeInterval: 1.0 / 60.0)
+            }
+        }
+        t.name = "LDrawVulkanRenderLoop"
+        thread = t
+        t.start()
+    }
+
+    private func requestStop() {
+        stateLock.lock()
+        shouldStop = true
+        stateLock.unlock()
+        // Give the loop a moment to exit its current drawFrame() before we tear down Vulkan
+        // objects out from under it.
+        while thread?.isExecuting == true {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        // Order matters: the renderer's deinit calls vkDeviceWaitIdle and destroys the swapchain
+        // built from `surface` — that must happen *before* we destroy the surface itself, or the
+        // driver is left with a dangling swapchain->surface reference (this previously wedged
+        // the emulator's Vulkan driver entirely, taking the whole device offline).
+        renderer = nil
+        vkDestroySurfaceKHR(context.instance, surface, nil)
+        ANativeWindow_release(nativeWindow)
+        context = nil
+    }
+}
+
+// MARK: - Model loading
+
+private func loadModel(assetDir: String, into renderer: LDrawVulkanSwapchainRenderer) {
     let assetRoot = URL(fileURLWithPath: assetDir, isDirectory: true)
 
     let colorTable: LDrawColorTable
@@ -52,23 +179,19 @@ private func runTest(assetDir: String, outputPath: String, width: Int, height: I
     let resolver = AndroidFileSystemPartResolver(searchDirectories: searchDirs)
     let modelResolver = LDrawModelResolver(resolver: resolver, missingPartPolicy: .omit)
 
-    let resolved: ResolvedLDrawModel
-    do {
-        let text = try String(contentsOf: assetRoot.appendingPathComponent("parts/3001.dat"), encoding: .utf8)
-        let parsed = try LDrawParser.parseFile(text)
-        resolved = try modelResolver.resolve(parsed)
-    } catch {
-        return "FAIL: could not load model: \(error)"
+    guard
+        let text = try? String(contentsOf: assetRoot.appendingPathComponent("parts/3001.dat"), encoding: .utf8),
+        let parsed = try? LDrawParser.parseFile(text),
+        let resolved = try? modelResolver.resolve(parsed)
+    else {
+        logger.error("Failed to load bundled model")
+        return
     }
 
     let vertices = LDrawVulkanFlattener(colorTable: colorTable, defaultColor: defaultColor).flatten(resolved)
-    guard !vertices.isEmpty else { return "FAIL: model produced no geometry" }
-
-    guard let context = LDrawVulkanContext() else {
-        return "FAIL: could not initialize Vulkan (no driver on this device?)"
-    }
-    guard let renderer = LDrawVulkanOffscreenRenderer(context: context, width: width, height: height) else {
-        return "FAIL: could not create Vulkan renderer (missing compiled SPIR-V shaders?)"
+    guard !vertices.isEmpty else {
+        logger.error("Model produced no geometry")
+        return
     }
 
     var minP = Vector3(x: vertices[0].px, y: vertices[0].py, z: vertices[0].pz)
@@ -84,31 +207,7 @@ private func runTest(assetDir: String, outputPath: String, width: Int, height: I
     renderer.distance = modelRadius * 3.5
     renderer.upload(vertices: vertices)
 
-    let pixels = renderer.renderToRGBA()
-    guard pixels.count == width * height * 4 else {
-        return "FAIL: readback produced \(pixels.count) bytes, expected \(width * height * 4)"
-    }
-
-    do {
-        try writePPM(rgba: pixels, width: width, height: height, to: outputPath)
-    } catch {
-        return "FAIL: rendered \(vertices.count / 3) triangles but could not write \(outputPath): \(error)"
-    }
-
-    return "OK: rendered \(vertices.count / 3) triangles, \(width)x\(height), wrote \(outputPath)"
-}
-
-private func writePPM(rgba: [UInt8], width: Int, height: Int, to path: String) throws {
-    var data = Data("P6\n\(width) \(height)\n255\n".utf8)
-    var rgb = [UInt8]()
-    rgb.reserveCapacity(width * height * 3)
-    for i in stride(from: 0, to: rgba.count, by: 4) {
-        rgb.append(rgba[i])
-        rgb.append(rgba[i + 1])
-        rgb.append(rgba[i + 2])
-    }
-    data.append(contentsOf: rgb)
-    try data.write(to: URL(fileURLWithPath: path))
+    logger.info("Loaded model: \(vertices.count / 3) triangles")
 }
 
 // MARK: - Part resolver
@@ -140,8 +239,13 @@ private func jstringToString(_ env: UnsafeMutablePointer<JNIEnv?>, _ value: jstr
     return String(cString: cStr)
 }
 
-private func stringToJString(_ env: UnsafeMutablePointer<JNIEnv?>, _ value: String) -> jstring? {
-    value.withCString { cStr in
-        env.pointee?.pointee.NewStringUTF(env, cStr)
+// MARK: - logcat
+
+private struct AndroidLog {
+    let tag: String
+    func info(_ message: String) { log(ANDROID_LOG_INFO, message) }
+    func error(_ message: String) { log(ANDROID_LOG_ERROR, message) }
+    private func log(_ priority: android_LogPriority, _ message: String) {
+        _ = __android_log_write(Int32(priority.rawValue), tag, message)
     }
 }

@@ -8,38 +8,42 @@ import Foundation
 import CVulkan
 import LegoDrawFile
 
-/// Renders a flattened LDraw model into an off-screen RGBA8 color image
-/// (with a real depth buffer) and reads the result back to host memory.
+/// Renders a flattened LDraw model to an on-screen swapchain, one frame at a
+/// time via ``drawFrame()``. The caller supplies an already-created
+/// `VkSurfaceKHR` (e.g. from `vkCreateAndroidSurfaceKHR` given an
+/// `ANativeWindow`) and is responsible for driving a render loop that calls
+/// `drawFrame()` repeatedly — this class has no threading or event-loop
+/// logic of its own.
 ///
-/// This has no windowing-system dependency — it's the Vulkan equivalent of
-/// `RenderLDrawModel`'s SceneKit snapshot path, suitable for headless
-/// rendering (CI, screenshots, testing). On-screen presentation via a
-/// `VkSurfaceKHR` supplied by a window toolkit (SDL, GLFW, XCB, Wayland) is
-/// a natural extension point but out of scope here.
-public final class LDrawVulkanOffscreenRenderer {
+/// Single frame in flight (one command buffer, one pair of semaphores, one
+/// fence) — simple and correct, at the cost of not overlapping CPU/GPU work
+/// across frames. Fine for a spinning demo model; a real game would want 2-3
+/// frames in flight.
+public final class LDrawVulkanSwapchainRenderer {
 
-    // MARK: - Camera (set externally, same convention as the GLES/Metal renderers)
+    // MARK: - Camera (set externally, same convention as the offscreen renderer)
     public var azimuth: Float = 0
     public var elevation: Float = 0.4
     public var distance: Float = 100
     public var modelCenter = Vector3.zero
     public var modelRadius: Float = 50
 
-    public let width: Int
-    public let height: Int
-
     private let context: LDrawVulkanContext
+    private let surface: VkSurfaceKHR
     private var device: VkDevice { context.device }
+    private let shaderDirectory: URL?
 
-    private var colorImage: VkImage!
-    private var colorImageMemory: VkDeviceMemory!
-    private var colorImageView: VkImageView!
+    private var swapchain: VkSwapchainKHR!
+    private var swapchainFormat = VK_FORMAT_UNDEFINED
+    private var swapchainExtent = VkExtent2D(width: 0, height: 0)
+    private var swapchainImageViews: [VkImageView] = []
+    private var swapchainFramebuffers: [VkFramebuffer] = []
+
     private var depthImage: VkImage!
     private var depthImageMemory: VkDeviceMemory!
     private var depthImageView: VkImageView!
-    private var renderPass: VkRenderPass!
-    private var framebuffer: VkFramebuffer!
 
+    private var renderPass: VkRenderPass!
     private var descriptorSetLayout: VkDescriptorSetLayout!
     private var pipelineLayout: VkPipelineLayout!
     private var pipeline: VkPipeline!
@@ -53,43 +57,40 @@ public final class LDrawVulkanOffscreenRenderer {
     private var uniformBuffer: VkBuffer!
     private var uniformBufferMemory: VkDeviceMemory!
 
-    private var readbackBuffer: VkBuffer!
-    private var readbackBufferMemory: VkDeviceMemory!
-
     private var commandBuffer: VkCommandBuffer!
-    private var fence: VkFence!
+    private var imageAvailableSemaphore: VkSemaphore!
+    private var renderFinishedSemaphore: VkSemaphore!
+    private var inFlightFence: VkFence!
 
-    private static let colorFormat = VK_FORMAT_R8G8B8A8_UNORM
     private static let depthFormat = VK_FORMAT_D32_SFLOAT
 
-    /// Directory to look for `triangle.vert.spv`/`triangle.frag.spv` in, overriding the default
-    /// `Bundle.module` lookup. Needed on Android: `Bundle.module`'s generated accessor resolves
-    /// paths relative to `Bundle.main`, which isn't meaningful for a shared library loaded via
-    /// JNI into a host `app_process` — there the caller extracts the shaders from the APK's
-    /// assets to a known filesystem directory and passes it here instead.
-    private let shaderDirectory: URL?
-
-    public init?(context: LDrawVulkanContext, width: Int, height: Int, shaderDirectory: URL? = nil) {
+    public init?(
+        context: LDrawVulkanContext,
+        surface: VkSurfaceKHR,
+        width: Int,
+        height: Int,
+        shaderDirectory: URL? = nil
+    ) {
         self.context = context
-        self.width = width
-        self.height = height
+        self.surface = surface
         self.shaderDirectory = shaderDirectory
 
-        guard createAttachments() else { return nil }
+        guard createSwapchain(width: width, height: height) else { return nil }
+        guard createDepthResources() else { return nil }
         guard createRenderPass() else { return nil }
-        guard createFramebuffer() else { return nil }
+        guard createFramebuffers() else { return nil }
         guard createUniformBuffer() else { return nil }
         guard createDescriptorSet() else { return nil }
         guard createPipeline() else { return nil }
-        guard createReadbackBuffer() else { return nil }
-        guard createCommandBufferAndFence() else { return nil }
+        guard createCommandBufferAndSync() else { return nil }
     }
 
     deinit {
-        vkDestroyFence(device, fence, nil)
+        vkDeviceWaitIdle(device)
+        vkDestroySemaphore(device, imageAvailableSemaphore, nil)
+        vkDestroySemaphore(device, renderFinishedSemaphore, nil)
+        vkDestroyFence(device, inFlightFence, nil)
         vkFreeCommandBuffers(device, context.commandPool, 1, [commandBuffer])
-        vkDestroyBuffer(device, readbackBuffer, nil)
-        vkFreeMemory(device, readbackBufferMemory, nil)
         if let vb = vertexBuffer { vkDestroyBuffer(device, vb, nil) }
         if let vbm = vertexBufferMemory { vkFreeMemory(device, vbm, nil) }
         vkDestroyBuffer(device, uniformBuffer, nil)
@@ -98,14 +99,13 @@ public final class LDrawVulkanOffscreenRenderer {
         vkDestroyPipeline(device, pipeline, nil)
         vkDestroyPipelineLayout(device, pipelineLayout, nil)
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nil)
-        vkDestroyFramebuffer(device, framebuffer, nil)
+        for fb in swapchainFramebuffers { vkDestroyFramebuffer(device, fb, nil) }
         vkDestroyRenderPass(device, renderPass, nil)
         vkDestroyImageView(device, depthImageView, nil)
         vkDestroyImage(device, depthImage, nil)
         vkFreeMemory(device, depthImageMemory, nil)
-        vkDestroyImageView(device, colorImageView, nil)
-        vkDestroyImage(device, colorImage, nil)
-        vkFreeMemory(device, colorImageMemory, nil)
+        for view in swapchainImageViews { vkDestroyImageView(device, view, nil) }
+        vkDestroySwapchainKHR(device, swapchain, nil)
     }
 
     // MARK: - Upload
@@ -137,16 +137,24 @@ public final class LDrawVulkanOffscreenRenderer {
         vertexBufferMemory = memory
     }
 
-    // MARK: - Draw + readback
+    // MARK: - Draw
 
-    /// Renders one frame and returns tightly-packed RGBA8 pixels,
-    /// `width * height * 4` bytes, row-major top-to-bottom.
-    public func renderToRGBA() -> [UInt8] {
+    /// Renders and presents exactly one frame. Call this repeatedly from
+    /// your render loop (e.g. every ~16ms for 60fps).
+    @discardableResult
+    public func drawFrame() -> Bool {
+        vkWaitForFences(device, 1, [inFlightFence], VkBool32(VK_TRUE), UInt64.max)
+        vkResetFences(device, 1, [inFlightFence])
+
+        var imageIndex: UInt32 = 0
+        let acquireResult = vkAcquireNextImageKHR(
+            device, swapchain, UInt64.max, imageAvailableSemaphore, nil, &imageIndex
+        )
+        guard acquireResult == VK_SUCCESS || acquireResult == VK_SUBOPTIMAL_KHR else { return false }
+
         updateUniforms()
 
-        vkResetFences(device, 1, [fence])
         vkResetCommandBuffer(commandBuffer, 0)
-
         var beginInfo = VkCommandBufferBeginInfo()
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
         vkBeginCommandBuffer(commandBuffer, &beginInfo)
@@ -159,9 +167,8 @@ public final class LDrawVulkanOffscreenRenderer {
             var rpBegin = VkRenderPassBeginInfo()
             rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
             rpBegin.renderPass = renderPass
-            rpBegin.framebuffer = framebuffer
-            rpBegin.renderArea = VkRect2D(offset: VkOffset2D(x: 0, y: 0),
-                                           extent: VkExtent2D(width: UInt32(width), height: UInt32(height)))
+            rpBegin.framebuffer = swapchainFramebuffers[Int(imageIndex)]
+            rpBegin.renderArea = VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: swapchainExtent)
             rpBegin.clearValueCount = 2
             rpBegin.pClearValues = clearPtr.baseAddress
             vkCmdBeginRenderPass(commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE)
@@ -169,9 +176,12 @@ public final class LDrawVulkanOffscreenRenderer {
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
 
-        var viewport = VkViewport(x: 0, y: 0, width: Float(width), height: Float(height), minDepth: 0, maxDepth: 1)
+        var viewport = VkViewport(
+            x: 0, y: 0, width: Float(swapchainExtent.width), height: Float(swapchainExtent.height),
+            minDepth: 0, maxDepth: 1
+        )
         vkCmdSetViewport(commandBuffer, 0, 1, &viewport)
-        var scissor = VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: VkExtent2D(width: UInt32(width), height: UInt32(height)))
+        var scissor = VkRect2D(offset: VkOffset2D(x: 0, y: 0), extent: swapchainExtent)
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor)
 
         var descSet: VkDescriptorSet? = descriptorSet
@@ -185,108 +195,164 @@ public final class LDrawVulkanOffscreenRenderer {
         }
 
         vkCmdEndRenderPass(commandBuffer)
-
-        transitionAndCopyToReadback(commandBuffer: commandBuffer)
-
         vkEndCommandBuffer(commandBuffer)
 
+        var waitSemaphore: VkSemaphore? = imageAvailableSemaphore
+        var signalSemaphore: VkSemaphore? = renderFinishedSemaphore
+        var waitStage = VkPipelineStageFlags(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue)
         var cmdBuf: VkCommandBuffer? = commandBuffer
+
         var submitInfo = VkSubmitInfo()
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO
-        submitInfo.commandBufferCount = 1
-        withUnsafePointer(to: &cmdBuf) { ptr in
-            submitInfo.pCommandBuffers = ptr
-            vkQueueSubmit(context.graphicsQueue, 1, &submitInfo, fence)
+        withUnsafePointer(to: &waitSemaphore) { waitPtr in
+            withUnsafePointer(to: &waitStage) { stagePtr in
+                withUnsafePointer(to: &cmdBuf) { cmdPtr in
+                    withUnsafePointer(to: &signalSemaphore) { signalPtr in
+                        submitInfo.waitSemaphoreCount = 1
+                        submitInfo.pWaitSemaphores = waitPtr
+                        submitInfo.pWaitDstStageMask = stagePtr
+                        submitInfo.commandBufferCount = 1
+                        submitInfo.pCommandBuffers = cmdPtr
+                        submitInfo.signalSemaphoreCount = 1
+                        submitInfo.pSignalSemaphores = signalPtr
+                        vkQueueSubmit(context.graphicsQueue, 1, &submitInfo, inFlightFence)
+                    }
+                }
+            }
         }
-        vkWaitForFences(device, 1, [fence], VkBool32(VK_TRUE), UInt64.max)
 
-        return readPixels()
-    }
-
-    // MARK: - Attachments
-
-    private func createAttachments() -> Bool {
-        guard let (img, mem) = createImage(
-            format: Self.colorFormat,
-            usage: UInt32(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT.rawValue | VK_IMAGE_USAGE_TRANSFER_SRC_BIT.rawValue)
-        ) else { return false }
-        colorImage = img; colorImageMemory = mem
-        guard let civ = createImageView(image: img, format: Self.colorFormat, aspect: UInt32(VK_IMAGE_ASPECT_COLOR_BIT.rawValue))
-        else { return false }
-        colorImageView = civ
-
-        guard let (dimg, dmem) = createImage(
-            format: Self.depthFormat,
-            usage: UInt32(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT.rawValue)
-        ) else { return false }
-        depthImage = dimg; depthImageMemory = dmem
-        guard let div = createImageView(image: dimg, format: Self.depthFormat, aspect: UInt32(VK_IMAGE_ASPECT_DEPTH_BIT.rawValue))
-        else { return false }
-        depthImageView = div
-
+        var presentSwapchain: VkSwapchainKHR? = swapchain
+        var presentImageIndex = imageIndex
+        var presentInfo = VkPresentInfoKHR()
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR
+        withUnsafePointer(to: &signalSemaphore) { signalPtr in
+            withUnsafePointer(to: &presentSwapchain) { swapchainPtr in
+                withUnsafePointer(to: &presentImageIndex) { indexPtr in
+                    presentInfo.waitSemaphoreCount = 1
+                    presentInfo.pWaitSemaphores = signalPtr
+                    presentInfo.swapchainCount = 1
+                    presentInfo.pSwapchains = swapchainPtr
+                    presentInfo.pImageIndices = indexPtr
+                    vkQueuePresentKHR(context.graphicsQueue, &presentInfo)
+                }
+            }
+        }
         return true
     }
 
-    private func createImage(format: VkFormat, usage: VkImageUsageFlags) -> (VkImage, VkDeviceMemory)? {
-        var info = VkImageCreateInfo()
-        info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
-        info.imageType = VK_IMAGE_TYPE_2D
-        info.format = format
-        info.extent = VkExtent3D(width: UInt32(width), height: UInt32(height), depth: 1)
-        info.mipLevels = 1
-        info.arrayLayers = 1
-        info.samples = VK_SAMPLE_COUNT_1_BIT
-        info.tiling = VK_IMAGE_TILING_OPTIMAL
-        info.usage = usage
-        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE
-        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
-
-        var image: VkImage? = nil
-        guard vkCreateImage(device, &info, nil, &image) == VK_SUCCESS, let image else { return nil }
-
-        var req = VkMemoryRequirements()
-        vkGetImageMemoryRequirements(device, image, &req)
-        guard let typeIndex = context.findMemoryType(
-            typeBits: req.memoryTypeBits,
-            properties: UInt32(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.rawValue)
-        ) else { return nil }
-
-        var allocInfo = VkMemoryAllocateInfo()
-        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
-        allocInfo.allocationSize = req.size
-        allocInfo.memoryTypeIndex = typeIndex
-        var memory: VkDeviceMemory? = nil
-        guard vkAllocateMemory(device, &allocInfo, nil, &memory) == VK_SUCCESS, let memory else { return nil }
-        vkBindImageMemory(device, image, memory, 0)
-        return (image, memory)
-    }
-
-    private func createImageView(image: VkImage, format: VkFormat, aspect: VkImageAspectFlags) -> VkImageView? {
-        var info = VkImageViewCreateInfo()
-        info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
-        info.image = image
-        info.viewType = VK_IMAGE_VIEW_TYPE_2D
-        info.format = format
-        info.subresourceRange = VkImageSubresourceRange(
-            aspectMask: aspect, baseMipLevel: 0, levelCount: 1, baseArrayLayer: 0, layerCount: 1
+    private func updateUniforms() {
+        let orbitOffset = Vector3(
+            x: distance * cosf(elevation) * sinf(azimuth),
+            y: distance * sinf(elevation),
+            z: distance * cosf(elevation) * cosf(azimuth)
         )
-        var view: VkImageView? = nil
-        guard vkCreateImageView(device, &info, nil, &view) == VK_SUCCESS else { return nil }
-        return view
+        let eye = modelCenter + orbitOffset
+        let view = lookAt(eye: eye, center: modelCenter, up: Vector3(x: 0, y: -1, z: 0))
+        let near = max(1.0, distance - modelRadius * 2)
+        let far = distance + modelRadius * 2
+        let aspect = Float(swapchainExtent.width) / Float(max(1, swapchainExtent.height))
+        let proj = perspectiveVulkan(fovY: .pi / 4, aspect: aspect, near: near, far: far)
+        let mvp = proj * view
+        let normalMatrix = Mat4(m: [
+            view.m[0], view.m[1], view.m[2], 0,
+            view.m[4], view.m[5], view.m[6], 0,
+            view.m[8], view.m[9], view.m[10], 0,
+            0, 0, 0, 1
+        ])
+
+        let data = mvp.m + normalMatrix.m
+        var mapped: UnsafeMutableRawPointer? = nil
+        vkMapMemory(device, uniformBufferMemory, 0, VkDeviceSize(data.count * MemoryLayout<Float>.stride), 0, &mapped)
+        data.withUnsafeBytes { src in
+            mapped?.copyMemory(from: src.baseAddress!, byteCount: src.count)
+        }
+        vkUnmapMemory(device, uniformBufferMemory)
     }
 
-    // MARK: - Render pass + framebuffer
+    // MARK: - Swapchain
+
+    private func createSwapchain(width: Int, height: Int) -> Bool {
+        var capabilities = VkSurfaceCapabilitiesKHR()
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(context.physicalDevice, surface, &capabilities)
+
+        var formatCount: UInt32 = 0
+        vkGetPhysicalDeviceSurfaceFormatsKHR(context.physicalDevice, surface, &formatCount, nil)
+        guard formatCount > 0 else { return false }
+        var formats = [VkSurfaceFormatKHR](repeating: VkSurfaceFormatKHR(), count: Int(formatCount))
+        vkGetPhysicalDeviceSurfaceFormatsKHR(context.physicalDevice, surface, &formatCount, &formats)
+        let chosenFormat = formats.first { $0.format == VK_FORMAT_R8G8B8A8_UNORM || $0.format == VK_FORMAT_B8G8R8A8_UNORM }
+            ?? formats[0]
+        swapchainFormat = chosenFormat.format
+
+        let extent: VkExtent2D
+        if capabilities.currentExtent.width != UInt32.max {
+            extent = capabilities.currentExtent
+        } else {
+            extent = VkExtent2D(
+                width: UInt32(width).clamped(capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
+                height: UInt32(height).clamped(capabilities.minImageExtent.height, capabilities.maxImageExtent.height)
+            )
+        }
+        swapchainExtent = extent
+
+        var imageCount = capabilities.minImageCount + 1
+        if capabilities.maxImageCount > 0 { imageCount = min(imageCount, capabilities.maxImageCount) }
+
+        var createInfo = VkSwapchainCreateInfoKHR()
+        createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR
+        createInfo.surface = surface
+        createInfo.minImageCount = imageCount
+        createInfo.imageFormat = chosenFormat.format
+        createInfo.imageColorSpace = chosenFormat.colorSpace
+        createInfo.imageExtent = extent
+        createInfo.imageArrayLayers = 1
+        createInfo.imageUsage = UInt32(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT.rawValue)
+        createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE
+        createInfo.preTransform = capabilities.currentTransform
+        createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+        createInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR // always supported, vsync'd
+        createInfo.clipped = VkBool32(VK_TRUE)
+
+        var created: VkSwapchainKHR? = nil
+        guard vkCreateSwapchainKHR(device, &createInfo, nil, &created) == VK_SUCCESS, let created else { return false }
+        swapchain = created
+
+        var actualCount: UInt32 = 0
+        vkGetSwapchainImagesKHR(device, swapchain, &actualCount, nil)
+        var images = [VkImage?](repeating: nil, count: Int(actualCount))
+        vkGetSwapchainImagesKHR(device, swapchain, &actualCount, &images)
+
+        swapchainImageViews = images.compactMap { image -> VkImageView? in
+            guard let image else { return nil }
+            return createImageView(image: image, format: swapchainFormat, aspect: UInt32(VK_IMAGE_ASPECT_COLOR_BIT.rawValue))
+        }
+        return swapchainImageViews.count == images.count
+    }
+
+    private func createDepthResources() -> Bool {
+        guard let (img, mem) = createImage(
+            format: Self.depthFormat,
+            extent: swapchainExtent,
+            usage: UInt32(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT.rawValue)
+        ) else { return false }
+        depthImage = img
+        depthImageMemory = mem
+        guard let view = createImageView(image: img, format: Self.depthFormat, aspect: UInt32(VK_IMAGE_ASPECT_DEPTH_BIT.rawValue))
+        else { return false }
+        depthImageView = view
+        return true
+    }
 
     private func createRenderPass() -> Bool {
         var colorAttachment = VkAttachmentDescription()
-        colorAttachment.format = Self.colorFormat
+        colorAttachment.format = swapchainFormat
         colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT
         colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR
         colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE
         colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE
         colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE
         colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
-        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
 
         var depthAttachment = VkAttachmentDescription()
         depthAttachment.format = Self.depthFormat
@@ -305,6 +371,14 @@ public final class LDrawVulkanOffscreenRenderer {
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS
         subpass.colorAttachmentCount = 1
 
+        var dependency = VkSubpassDependency()
+        dependency.srcSubpass = UInt32(truncatingIfNeeded: VK_SUBPASS_EXTERNAL)
+        dependency.dstSubpass = 0
+        dependency.srcStageMask = UInt32(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue)
+        dependency.dstStageMask = UInt32(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT.rawValue)
+        dependency.srcAccessMask = 0
+        dependency.dstAccessMask = UInt32(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT.rawValue)
+
         let attachments = [colorAttachment, depthAttachment]
         var result: VkResult = VK_ERROR_UNKNOWN
         var createdPass: VkRenderPass? = nil
@@ -314,13 +388,17 @@ public final class LDrawVulkanOffscreenRenderer {
                     subpass.pColorAttachments = colorRefPtr
                     subpass.pDepthStencilAttachment = depthRefPtr
                     withUnsafePointer(to: &subpass) { subpassPtr in
-                        var rpInfo = VkRenderPassCreateInfo()
-                        rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
-                        rpInfo.attachmentCount = UInt32(attachments.count)
-                        rpInfo.pAttachments = attachPtr.baseAddress
-                        rpInfo.subpassCount = 1
-                        rpInfo.pSubpasses = subpassPtr
-                        result = vkCreateRenderPass(device, &rpInfo, nil, &createdPass)
+                        withUnsafePointer(to: &dependency) { depPtr in
+                            var rpInfo = VkRenderPassCreateInfo()
+                            rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+                            rpInfo.attachmentCount = UInt32(attachments.count)
+                            rpInfo.pAttachments = attachPtr.baseAddress
+                            rpInfo.subpassCount = 1
+                            rpInfo.pSubpasses = subpassPtr
+                            rpInfo.dependencyCount = 1
+                            rpInfo.pDependencies = depPtr
+                            result = vkCreateRenderPass(device, &rpInfo, nil, &createdPass)
+                        }
                     }
                 }
             }
@@ -330,29 +408,30 @@ public final class LDrawVulkanOffscreenRenderer {
         return true
     }
 
-    private func createFramebuffer() -> Bool {
-        let attachments: [VkImageView?] = [colorImageView, depthImageView]
-        var fb: VkFramebuffer? = nil
-        let result: VkResult = attachments.withUnsafeBufferPointer { attachPtr in
-            var info = VkFramebufferCreateInfo()
-            info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
-            info.renderPass = renderPass
-            info.attachmentCount = UInt32(attachments.count)
-            info.pAttachments = attachPtr.baseAddress
-            info.width = UInt32(width)
-            info.height = UInt32(height)
-            info.layers = 1
-            return vkCreateFramebuffer(device, &info, nil, &fb)
+    private func createFramebuffers() -> Bool {
+        for colorView in swapchainImageViews {
+            let attachments: [VkImageView?] = [colorView, depthImageView]
+            var fb: VkFramebuffer? = nil
+            let result: VkResult = attachments.withUnsafeBufferPointer { attachPtr in
+                var info = VkFramebufferCreateInfo()
+                info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+                info.renderPass = renderPass
+                info.attachmentCount = UInt32(attachments.count)
+                info.pAttachments = attachPtr.baseAddress
+                info.width = swapchainExtent.width
+                info.height = swapchainExtent.height
+                info.layers = 1
+                return vkCreateFramebuffer(device, &info, nil, &fb)
+            }
+            guard result == VK_SUCCESS, let framebuffer = fb else { return false }
+            swapchainFramebuffers.append(framebuffer)
         }
-        guard result == VK_SUCCESS, let framebuffer = fb else { return false }
-        self.framebuffer = framebuffer
         return true
     }
 
-    // MARK: - Uniforms + descriptors
+    // MARK: - Uniforms + descriptors + pipeline (same layout as the offscreen renderer)
 
     private func createUniformBuffer() -> Bool {
-        // Two mat4 (16 floats each) = 128 bytes
         let size = MemoryLayout<Float>.stride * 32
         let (buf, mem) = createBuffer(
             size: size,
@@ -423,36 +502,6 @@ public final class LDrawVulkanOffscreenRenderer {
         return true
     }
 
-    private func updateUniforms() {
-        let orbitOffset = Vector3(
-            x: distance * cosf(elevation) * sinf(azimuth),
-            y: distance * sinf(elevation),
-            z: distance * cosf(elevation) * cosf(azimuth)
-        )
-        let eye = modelCenter + orbitOffset
-        let view = lookAt(eye: eye, center: modelCenter, up: Vector3(x: 0, y: -1, z: 0))
-        let near = max(1.0, distance - modelRadius * 2)
-        let far = distance + modelRadius * 2
-        let proj = perspectiveVulkan(fovY: .pi / 4, aspect: Float(width) / Float(height), near: near, far: far)
-        let mvp = proj * view
-        let normalMatrix = Mat4(m: [
-            view.m[0], view.m[1], view.m[2], 0,
-            view.m[4], view.m[5], view.m[6], 0,
-            view.m[8], view.m[9], view.m[10], 0,
-            0, 0, 0, 1
-        ])
-
-        let data = mvp.m + normalMatrix.m
-        var mapped: UnsafeMutableRawPointer? = nil
-        vkMapMemory(device, uniformBufferMemory, 0, VkDeviceSize(data.count * MemoryLayout<Float>.stride), 0, &mapped)
-        data.withUnsafeBytes { src in
-            mapped?.copyMemory(from: src.baseAddress!, byteCount: src.count)
-        }
-        vkUnmapMemory(device, uniformBufferMemory)
-    }
-
-    // MARK: - Pipeline
-
     private func createPipeline() -> Bool {
         guard
             let vertModule = loadShaderModule(named: "triangle.vert.spv"),
@@ -495,7 +544,6 @@ public final class LDrawVulkanOffscreenRenderer {
 
         let stages = [vertStage, fragStage]
 
-        // Vertex input: position(0)@0, normal(1)@12, color(2)@24, stride 40
         var binding = VkVertexInputBindingDescription(
             binding: 0, stride: UInt32(MemoryLayout<LDrawVulkanVertex>.stride), inputRate: VK_VERTEX_INPUT_RATE_VERTEX
         )
@@ -517,7 +565,7 @@ public final class LDrawVulkanOffscreenRenderer {
         var rasterizer = VkPipelineRasterizationStateCreateInfo()
         rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
         rasterizer.polygonMode = VK_POLYGON_MODE_FILL
-        rasterizer.cullMode = UInt32(VK_CULL_MODE_NONE.rawValue) // double-sided (vertices duplicated with flipped winding)
+        rasterizer.cullMode = UInt32(VK_CULL_MODE_NONE.rawValue)
         rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE
         rasterizer.lineWidth = 1.0
 
@@ -627,7 +675,54 @@ public final class LDrawVulkanOffscreenRenderer {
         return module
     }
 
-    // MARK: - Buffers
+    // MARK: - Images + buffers
+
+    private func createImage(format: VkFormat, extent: VkExtent2D, usage: VkImageUsageFlags) -> (VkImage, VkDeviceMemory)? {
+        var info = VkImageCreateInfo()
+        info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+        info.imageType = VK_IMAGE_TYPE_2D
+        info.format = format
+        info.extent = VkExtent3D(width: extent.width, height: extent.height, depth: 1)
+        info.mipLevels = 1
+        info.arrayLayers = 1
+        info.samples = VK_SAMPLE_COUNT_1_BIT
+        info.tiling = VK_IMAGE_TILING_OPTIMAL
+        info.usage = usage
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+
+        var image: VkImage? = nil
+        guard vkCreateImage(device, &info, nil, &image) == VK_SUCCESS, let image else { return nil }
+
+        var req = VkMemoryRequirements()
+        vkGetImageMemoryRequirements(device, image, &req)
+        guard let typeIndex = context.findMemoryType(
+            typeBits: req.memoryTypeBits, properties: UInt32(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.rawValue)
+        ) else { return nil }
+
+        var allocInfo = VkMemoryAllocateInfo()
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+        allocInfo.allocationSize = req.size
+        allocInfo.memoryTypeIndex = typeIndex
+        var memory: VkDeviceMemory? = nil
+        guard vkAllocateMemory(device, &allocInfo, nil, &memory) == VK_SUCCESS, let memory else { return nil }
+        vkBindImageMemory(device, image, memory, 0)
+        return (image, memory)
+    }
+
+    private func createImageView(image: VkImage, format: VkFormat, aspect: VkImageAspectFlags) -> VkImageView? {
+        var info = VkImageViewCreateInfo()
+        info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+        info.image = image
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D
+        info.format = format
+        info.subresourceRange = VkImageSubresourceRange(
+            aspectMask: aspect, baseMipLevel: 0, levelCount: 1, baseArrayLayer: 0, layerCount: 1
+        )
+        var view: VkImageView? = nil
+        guard vkCreateImageView(device, &info, nil, &view) == VK_SUCCESS else { return nil }
+        return view
+    }
 
     private func createBuffer(size: Int, usage: VkBufferUsageFlags, properties: VkMemoryPropertyFlags) -> (VkBuffer?, VkDeviceMemory?) {
         var info = VkBufferCreateInfo()
@@ -655,55 +750,9 @@ public final class LDrawVulkanOffscreenRenderer {
         return (buffer, memory)
     }
 
-    private func createReadbackBuffer() -> Bool {
-        let size = width * height * 4
-        let (buf, mem) = createBuffer(
-            size: size,
-            usage: UInt32(VK_BUFFER_USAGE_TRANSFER_DST_BIT.rawValue),
-            properties: UInt32(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.rawValue | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.rawValue)
-        )
-        guard let buf, let mem else { return false }
-        readbackBuffer = buf
-        readbackBufferMemory = mem
-        return true
-    }
+    // MARK: - Command buffer + sync
 
-    private func transitionAndCopyToReadback(commandBuffer: VkCommandBuffer) {
-        var barrier = VkImageMemoryBarrier()
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
-        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL // matches renderPass finalLayout
-        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-        // VK_QUEUE_FAMILY_IGNORED imports with a differently-signed type on some platforms
-        // (e.g. Int32 vs UInt32); truncatingIfNeeded reinterprets the bits regardless.
-        barrier.srcQueueFamilyIndex = UInt32(truncatingIfNeeded: VK_QUEUE_FAMILY_IGNORED)
-        barrier.dstQueueFamilyIndex = UInt32(truncatingIfNeeded: VK_QUEUE_FAMILY_IGNORED)
-        barrier.image = colorImage
-        barrier.subresourceRange = VkImageSubresourceRange(
-            aspectMask: UInt32(VK_IMAGE_ASPECT_COLOR_BIT.rawValue), baseMipLevel: 0, levelCount: 1, baseArrayLayer: 0, layerCount: 1
-        )
-
-        var region = VkBufferImageCopy()
-        region.bufferOffset = 0
-        region.imageSubresource = VkImageSubresourceLayers(
-            aspectMask: UInt32(VK_IMAGE_ASPECT_COLOR_BIT.rawValue), mipLevel: 0, baseArrayLayer: 0, layerCount: 1
-        )
-        region.imageExtent = VkExtent3D(width: UInt32(width), height: UInt32(height), depth: 1)
-
-        vkCmdCopyImageToBuffer(commandBuffer, colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readbackBuffer, 1, &region)
-    }
-
-    private func readPixels() -> [UInt8] {
-        let size = width * height * 4
-        var mapped: UnsafeMutableRawPointer? = nil
-        vkMapMemory(device, readbackBufferMemory, 0, VkDeviceSize(size), 0, &mapped)
-        defer { vkUnmapMemory(device, readbackBufferMemory) }
-        guard let mapped else { return [] }
-        return [UInt8](UnsafeRawBufferPointer(start: mapped, count: size))
-    }
-
-    // MARK: - Command buffer + fence
-
-    private func createCommandBufferAndFence() -> Bool {
+    private func createCommandBufferAndSync() -> Bool {
         var allocInfo = VkCommandBufferAllocateInfo()
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
         allocInfo.commandPool = context.commandPool
@@ -713,21 +762,27 @@ public final class LDrawVulkanOffscreenRenderer {
         guard vkAllocateCommandBuffers(device, &allocInfo, &cmdBuf) == VK_SUCCESS, let cmdBuf else { return false }
         commandBuffer = cmdBuf
 
+        var semInfo = VkSemaphoreCreateInfo()
+        semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+        var sem1: VkSemaphore? = nil
+        var sem2: VkSemaphore? = nil
+        guard vkCreateSemaphore(device, &semInfo, nil, &sem1) == VK_SUCCESS, let sem1,
+              vkCreateSemaphore(device, &semInfo, nil, &sem2) == VK_SUCCESS, let sem2
+        else { return false }
+        imageAvailableSemaphore = sem1
+        renderFinishedSemaphore = sem2
+
         var fenceInfo = VkFenceCreateInfo()
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+        fenceInfo.flags = UInt32(VK_FENCE_CREATE_SIGNALED_BIT.rawValue)
         var f: VkFence? = nil
         guard vkCreateFence(device, &fenceInfo, nil, &f) == VK_SUCCESS, let f else { return false }
-        fence = f
+        inFlightFence = f
         return true
     }
 }
 
-/// Writes to fd 2 directly rather than through the global `stderr` `FILE*`, which isn't
-/// `Sendable`-safe under Swift 6 strict concurrency.
-func logToStderr(_ message: String) {
-    let bytes = Array(message.utf8)
-    bytes.withUnsafeBufferPointer { buf in
-        _ = write(2, buf.baseAddress, buf.count)
-    }
+private extension UInt32 {
+    func clamped(_ lo: UInt32, _ hi: UInt32) -> UInt32 { Swift.min(Swift.max(self, lo), hi) }
 }
 #endif

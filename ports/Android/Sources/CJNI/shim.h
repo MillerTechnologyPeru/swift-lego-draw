@@ -4,3 +4,5 @@
 // to just this repo's own package.
 #include <jni.h>
 #include <android/log.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
