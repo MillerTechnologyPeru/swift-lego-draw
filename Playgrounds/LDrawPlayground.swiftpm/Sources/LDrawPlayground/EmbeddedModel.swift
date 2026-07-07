@@ -3,50 +3,71 @@ import LegoDrawFile
 
 // MARK: - Model loading
 
-/// Loads the 2×4 brick (3001.dat) from the LDraw library if available on the
-/// file system (works when running as "Designed for iPad" on Mac), otherwise
-/// falls back to a simple embedded box so the playground is always renderable.
+/// Loads the 2×4 brick (3001.dat).  Resolution order:
+/// 1. Bundled `ldraw/` resource directory (always present in the app bundle)
+/// 2. System LDraw library via LDRAWDIR env var or /Applications/Bricksmith/ldraw
+/// 3. Hardcoded fallback box
 func loadModel(colorCode: Int16 = 4) -> (ResolvedLDrawModel, LDrawResolvedColor, LDrawColorTable) {
-    let ldrawDir = ProcessInfo.processInfo.environment["LDRAWDIR"]
-        ?? "/Applications/Bricksmith/ldraw"
-    let partsURL = URL(fileURLWithPath: ldrawDir)
 
-    let colorTable: LDrawColorTable
-    let ldConfigURL = partsURL.appendingPathComponent("LDConfig.ldr")
-    if let text = try? String(contentsOf: ldConfigURL, encoding: .utf8),
-       let table = try? LDrawColorTable.parsing(ldConfigText: text) {
-        colorTable = table
-    } else {
-        colorTable = LDrawColorTable()
+    // Build search directories: bundled first, then system library
+    var searchDirs: [URL] = []
+
+    if let bundledLDraw = Bundle.main.url(forResource: "ldraw", withExtension: nil) {
+        searchDirs += [
+            bundledLDraw.appendingPathComponent("parts"),
+            bundledLDraw.appendingPathComponent("parts/s"),
+            bundledLDraw.appendingPathComponent("p"),
+            bundledLDraw.appendingPathComponent("p/48"),
+        ]
     }
+
+    let systemBase = URL(fileURLWithPath:
+        ProcessInfo.processInfo.environment["LDRAWDIR"] ?? "/Applications/Bricksmith/ldraw")
+    searchDirs += [
+        systemBase.appendingPathComponent("parts"),
+        systemBase.appendingPathComponent("parts/s"),
+        systemBase.appendingPathComponent("p"),
+        systemBase.appendingPathComponent("p/48"),
+    ]
+
+    // Color table from bundled or system LDConfig.ldr
+    let colorTable: LDrawColorTable = {
+        let candidates = [
+            Bundle.main.url(forResource: "ldraw/LDConfig", withExtension: "ldr"),
+            Optional(systemBase.appendingPathComponent("LDConfig.ldr")),
+        ]
+        for url in candidates.compactMap({ $0 }) {
+            if let text = try? String(contentsOf: url, encoding: .utf8),
+               let table = try? LDrawColorTable.parsing(ldConfigText: text) {
+                return table
+            }
+        }
+        return LDrawColorTable()
+    }()
 
     let defaultColor = colorTable.color(forCode: colorCode)
         ?? LDrawResolvedColor(name: "Red", code: 4,
                               red: 199, green: 20, blue: 20,
                               edgeRed: 0, edgeGreen: 0, edgeBlue: 0)
 
-    // Try loading 3001.dat from the library
-    let searchDirs = [
-        partsURL.appendingPathComponent("parts"),
-        partsURL.appendingPathComponent("parts/s"),
-        partsURL.appendingPathComponent("p"),
-        partsURL.appendingPathComponent("p/48"),
-        partsURL.appendingPathComponent("models"),
-    ]
     let resolver = FileSystemPartResolver(searchDirectories: searchDirs)
     let modelResolver = LDrawModelResolver(resolver: resolver, missingPartPolicy: .omit)
 
-    let brickURL = partsURL.appendingPathComponent("parts/3001.dat")
-    if let text = try? String(contentsOf: brickURL, encoding: .utf8),
-       let file = try? LDrawParser.parseFile(text),
-       let model = try? modelResolver.resolve(file) {
-        return (model, defaultColor, colorTable)
+    // Try loading 3001.dat
+    for dir in searchDirs {
+        let url = dir.appendingPathComponent("3001.dat")
+        if let text = try? String(contentsOf: url, encoding: .utf8),
+           let file = try? LDrawParser.parseFile(text),
+           let model = try? modelResolver.resolve(file) {
+            return (model, defaultColor, colorTable)
+        }
     }
 
     // Fallback: simple embedded box
-    let fallbackModel = makeFallbackModel()
-    return (fallbackModel, defaultColor, colorTable)
+    return (makeFallbackModel(), defaultColor, colorTable)
 }
+
+// MARK: - Fallback
 
 private func makeFallbackModel() -> ResolvedLDrawModel {
     let src = """
@@ -63,7 +84,7 @@ private func makeFallbackModel() -> ResolvedLDrawModel {
     return try! LDrawModelResolver(resolver: NoOpResolver(), missingPartPolicy: .omit).resolve(file)
 }
 
-// MARK: - File system resolver
+// MARK: - Resolvers
 
 struct FileSystemPartResolver: LDrawPartResolver {
     var searchDirectories: [URL]

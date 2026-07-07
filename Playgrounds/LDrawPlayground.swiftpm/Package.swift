@@ -41,6 +41,9 @@ let package = Package(
             name: "LDrawPlayground",
             dependencies: [
                 .product(name: "LegoDrawFile", package: "swift-lego-draw")
+            ],
+            resources: [
+                .copy("ldraw")
             ]
         )
     ]
