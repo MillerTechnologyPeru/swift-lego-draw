@@ -52,7 +52,7 @@ final class OpenGLESRenderer: NSObject, GLKViewDelegate {
     var modelCenter = SIMD3<Float>.zero
     var modelRadius: Float = 50
 
-    private let context: EAGLContext
+    let context: EAGLContext
     private var program: GLuint = 0
     private var vbo: GLuint = 0
     private var vertexCount: Int = 0
