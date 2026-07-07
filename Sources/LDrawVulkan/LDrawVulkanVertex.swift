@@ -1,4 +1,4 @@
-#if os(Linux)
+#if os(Linux) || os(Android)
 import LegoDrawFile
 
 /// A single tightly-packed vertex for the Vulkan vertex buffer.

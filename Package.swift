@@ -46,7 +46,7 @@ let package = Package(
             name: "LDrawVulkan",
             dependencies: [
                 "LegoDrawFile",
-                .target(name: "CVulkan", condition: .when(platforms: [.linux])),
+                .target(name: "CVulkan", condition: .when(platforms: [.linux, .android])),
             ],
             resources: [.copy("Shaders")],
             swiftSettings: [.swiftLanguageMode(.v6)]

@@ -1,5 +1,9 @@
-#if os(Linux)
+#if os(Linux) || os(Android)
+#if os(Android)
+import Android
+#else
 import Glibc
+#endif
 import CVulkan
 
 /// Owns the top-level Vulkan objects shared by any renderer built on top of
@@ -16,13 +20,19 @@ public final class LDrawVulkanContext {
 
     public init?(applicationName: String = "LDrawVulkan", enableValidation: Bool = false) {
         // MARK: Instance
+        let applicationNameC = strdup(applicationName)
+        let engineNameC = strdup("LDrawVulkan")
+
         var appInfo = VkApplicationInfo()
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO
-        appInfo.pApplicationName = strdup(applicationName)
+        appInfo.pApplicationName = UnsafePointer(applicationNameC)
         appInfo.applicationVersion = 1
-        appInfo.pEngineName = strdup("LDrawVulkan")
+        appInfo.pEngineName = UnsafePointer(engineNameC)
         appInfo.engineVersion = 1
-        appInfo.apiVersion = UInt32(VK_API_VERSION_1_0)
+        // VK_API_VERSION_1_0 is a function-like macro (VK_MAKE_API_VERSION), which the Clang
+        // importer doesn't expose as a Swift constant — encode it directly per the Vulkan spec:
+        // (variant << 29) | (major << 22) | (minor << 12) | patch, i.e. variant 0, major 1.
+        appInfo.apiVersion = UInt32(1) << 22
 
         var instanceCreateInfo = VkInstanceCreateInfo()
         instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
@@ -32,8 +42,8 @@ public final class LDrawVulkanContext {
             instanceCreateInfo.pApplicationInfo = appInfoPtr
             return vkCreateInstance(&instanceCreateInfo, nil, &createdInstance)
         }
-        free(UnsafeMutableRawPointer(mutating: appInfo.pApplicationName))
-        free(UnsafeMutableRawPointer(mutating: appInfo.pEngineName))
+        free(applicationNameC)
+        free(engineNameC)
         guard instanceResult == VK_SUCCESS, let instance = createdInstance else { return nil }
         self.instance = instance
 

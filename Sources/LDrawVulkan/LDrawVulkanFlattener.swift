@@ -1,4 +1,4 @@
-#if os(Linux)
+#if os(Linux) || os(Android)
 import LegoDrawFile
 
 /// Walks a ``ResolvedLDrawModel`` tree and emits a flat ``[LDrawVulkanVertex]``

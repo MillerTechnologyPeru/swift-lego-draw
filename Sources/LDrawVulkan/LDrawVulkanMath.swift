@@ -1,5 +1,9 @@
-#if os(Linux)
+#if os(Linux) || os(Android)
+#if os(Android)
+import Android
+#else
 import Glibc
+#endif
 import LegoDrawFile
 
 /// Column-major 4×4 float matrix matching GLSL's `mat4` memory layout —

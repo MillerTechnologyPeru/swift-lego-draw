@@ -1,5 +1,9 @@
-#if os(Linux)
+#if os(Linux) || os(Android)
+#if os(Android)
+import Android
+#else
 import Glibc
+#endif
 import Foundation
 import CVulkan
 import LegoDrawFile
@@ -342,11 +346,12 @@ public final class LDrawVulkanOffscreenRenderer {
     private func createUniformBuffer() -> Bool {
         // Two mat4 (16 floats each) = 128 bytes
         let size = MemoryLayout<Float>.stride * 32
-        guard let (buf, mem) = createBuffer(
+        let (buf, mem) = createBuffer(
             size: size,
             usage: UInt32(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT.rawValue),
             properties: UInt32(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.rawValue | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.rawValue)
-        ) else { return false }
+        )
+        guard let buf, let mem else { return false }
         uniformBuffer = buf
         uniformBufferMemory = mem
         return true
@@ -429,7 +434,7 @@ public final class LDrawVulkanOffscreenRenderer {
             0, 0, 0, 1
         ])
 
-        var data = mvp.m + normalMatrix.m
+        let data = mvp.m + normalMatrix.m
         var mapped: UnsafeMutableRawPointer? = nil
         vkMapMemory(device, uniformBufferMemory, 0, VkDeviceSize(data.count * MemoryLayout<Float>.stride), 0, &mapped)
         data.withUnsafeBytes { src in
@@ -445,7 +450,7 @@ public final class LDrawVulkanOffscreenRenderer {
             let vertModule = loadShaderModule(named: "triangle.vert.spv"),
             let fragModule = loadShaderModule(named: "triangle.frag.spv")
         else {
-            fputs("LDrawVulkan: missing compiled shaders (run Sources/LDrawVulkan/Shaders/compile.sh)\n", stderr)
+            logToStderr("LDrawVulkan: missing compiled shaders (run Sources/LDrawVulkan/Shaders/compile.sh)\n")
             return false
         }
         defer {
@@ -638,11 +643,12 @@ public final class LDrawVulkanOffscreenRenderer {
 
     private func createReadbackBuffer() -> Bool {
         let size = width * height * 4
-        guard let (buf, mem) = createBuffer(
+        let (buf, mem) = createBuffer(
             size: size,
             usage: UInt32(VK_BUFFER_USAGE_TRANSFER_DST_BIT.rawValue),
             properties: UInt32(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.rawValue | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.rawValue)
-        ) else { return false }
+        )
+        guard let buf, let mem else { return false }
         readbackBuffer = buf
         readbackBufferMemory = mem
         return true
@@ -653,8 +659,10 @@ public final class LDrawVulkanOffscreenRenderer {
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
         barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL // matches renderPass finalLayout
         barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-        barrier.srcQueueFamilyIndex = UInt32(bitPattern: VK_QUEUE_FAMILY_IGNORED)
-        barrier.dstQueueFamilyIndex = UInt32(bitPattern: VK_QUEUE_FAMILY_IGNORED)
+        // VK_QUEUE_FAMILY_IGNORED imports with a differently-signed type on some platforms
+        // (e.g. Int32 vs UInt32); truncatingIfNeeded reinterprets the bits regardless.
+        barrier.srcQueueFamilyIndex = UInt32(truncatingIfNeeded: VK_QUEUE_FAMILY_IGNORED)
+        barrier.dstQueueFamilyIndex = UInt32(truncatingIfNeeded: VK_QUEUE_FAMILY_IGNORED)
         barrier.image = colorImage
         barrier.subresourceRange = VkImageSubresourceRange(
             aspectMask: UInt32(VK_IMAGE_ASPECT_COLOR_BIT.rawValue), baseMipLevel: 0, levelCount: 1, baseArrayLayer: 0, layerCount: 1
@@ -697,6 +705,15 @@ public final class LDrawVulkanOffscreenRenderer {
         guard vkCreateFence(device, &fenceInfo, nil, &f) == VK_SUCCESS, let f else { return false }
         fence = f
         return true
+    }
+}
+
+/// Writes to fd 2 directly rather than through the global `stderr` `FILE*`, which isn't
+/// `Sendable`-safe under Swift 6 strict concurrency.
+private func logToStderr(_ message: String) {
+    let bytes = Array(message.utf8)
+    bytes.withUnsafeBufferPointer { buf in
+        _ = write(2, buf.baseAddress, buf.count)
     }
 }
 #endif
