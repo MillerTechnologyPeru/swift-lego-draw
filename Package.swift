@@ -13,6 +13,7 @@ let package = Package(
         .library(name: "LDrawSceneKit", targets: ["LDrawSceneKit"]),
         .library(name: "LDrawMetal", targets: ["LDrawMetal"]),
         .library(name: "LDrawGLES", targets: ["LDrawGLES"]),
+        .library(name: "LDrawVulkan", targets: ["LDrawVulkan"]),
     ],
     targets: [
         .target(
@@ -40,6 +41,16 @@ let package = Package(
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .systemLibrary(name: "CVulkan"),
+        .target(
+            name: "LDrawVulkan",
+            dependencies: [
+                "LegoDrawFile",
+                .target(name: "CVulkan", condition: .when(platforms: [.linux])),
+            ],
+            resources: [.copy("Shaders")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .executableTarget(
             name: "RenderLDrawModel",
             dependencies: ["LDrawSceneKit"],
@@ -49,6 +60,11 @@ let package = Package(
             name: "MetalLDrawViewer",
             dependencies: ["LDrawMetal"],
             path: "Examples/MetalLDrawViewer"
+        ),
+        .executableTarget(
+            name: "VulkanLDrawRenderer",
+            dependencies: ["LDrawVulkan"],
+            path: "Examples/VulkanLDrawRenderer"
         ),
         .testTarget(
             name: "LegoDrawFileTests",
