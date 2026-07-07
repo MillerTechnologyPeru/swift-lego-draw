@@ -11,6 +11,14 @@ import LegoDrawFile
 /// against the view transform per frame, which is left as a documented future
 /// enhancement. By default they're built as hidden geometry (`isHidden = true`) so
 /// callers can toggle them on if desired; see ``LDrawOptionalLineRenderingMode``.
+///
+/// Faces render double-sided unconditionally. BFC (back-face culling) winding is
+/// still computed and used to orient each face's lighting normal, but single-sided
+/// culling based on it is not enabled: getting the accumulated CERTIFY/INVERTNEXT/
+/// mirrored-transform winding right for every face in every official part is a deep
+/// rabbit hole, and a single wrong face silently disappears rather than failing loudly.
+/// Double-sided rendering trades a minor, irrelevant-at-this-scale culling optimization
+/// for guaranteeing complete geometry.
 public struct LDrawSceneBuilder {
 
     public struct Options: Sendable {
@@ -40,16 +48,14 @@ public struct LDrawSceneBuilder {
         buildNode(
             from: model,
             inheritedColor: options.defaultColor,
-            effectiveCCW: model.bfcState.windingIsCCW,
-            doubleSided: model.bfcState.isCertified != true
+            effectiveCCW: model.bfcState.windingIsCCW
         )
     }
 
     private func buildNode(
         from model: ResolvedLDrawModel,
         inheritedColor: LDrawResolvedColor,
-        effectiveCCW: Bool,
-        doubleSided: Bool
+        effectiveCCW: Bool
     ) -> SCNNode {
         let node = SCNNode()
         node.name = model.name
@@ -63,8 +69,7 @@ public struct LDrawSceneBuilder {
                 let childNode = buildNode(
                     from: childModel,
                     inheritedColor: childColor,
-                    effectiveCCW: invertWinding ? !effectiveCCW : effectiveCCW,
-                    doubleSided: doubleSided || childModel.bfcState.isCertified != true
+                    effectiveCCW: invertWinding ? !effectiveCCW : effectiveCCW
                 )
                 childNode.transform = SCNMatrix4(transform)
                 node.addChildNode(childNode)
@@ -93,7 +98,7 @@ public struct LDrawSceneBuilder {
         }
 
         for geometry in accumulator.makeFaceGeometries(materialCache: materialCache) {
-            geometry.firstMaterial?.isDoubleSided = doubleSided
+            geometry.firstMaterial?.isDoubleSided = true
             node.addChildNode(SCNNode(geometry: geometry))
         }
         for geometry in accumulator.makeLineGeometries(materialCache: materialCache) {

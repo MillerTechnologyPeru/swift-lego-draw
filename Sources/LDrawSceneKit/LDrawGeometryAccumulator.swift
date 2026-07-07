@@ -41,12 +41,19 @@ struct LDrawGeometryAccumulator {
     ) {
         let normal = SCNVector3(LDrawBFCNormalResolver.faceNormal(vertices, ccw: ccw))
 
+        // GPU backface culling is driven by the actual submitted vertex winding, not by
+        // this separately-stored normal attribute. Reverse the emitted order whenever the
+        // effective winding is CW so the rasterizer's culling agrees with the normal above
+        // — otherwise faces under `BFC INVERTNEXT` / mirrored transforms get culled from
+        // the wrong side and disappear.
+        let orderedVertices = ccw ? vertices : Array(vertices.reversed())
+
         var positions = facePositionsByColor[resolvedColor] ?? []
         var normals = faceNormalsByColor[resolvedColor] ?? []
         var indices = faceIndicesByColor[resolvedColor] ?? []
 
         let baseIndex = Int32(positions.count)
-        for vertex in vertices {
+        for vertex in orderedVertices {
             positions.append(SCNVector3(vertex))
             normals.append(normal)
         }
