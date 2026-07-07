@@ -9,9 +9,9 @@ import Darwin
 #endif
 
 /// A simple look-at perspective camera used to project world-space points onto a
-/// 2D viewport for the SDL painter's-algorithm renderer. This is plain scalar math
-/// (no matrix stack) since the renderer only ever needs to project points, not
-/// compose transforms.
+/// 2D viewport for the SDL software rasterizer. This is plain scalar math (no
+/// matrix stack) since the renderer only ever needs to project points, not compose
+/// transforms.
 struct LDrawCamera {
     var eye: Vector3
     var target: Vector3
@@ -36,10 +36,22 @@ struct LDrawCamera {
         self.farPlane = farPlane
     }
 
+    struct ProjectedPoint {
+        var x: Float
+        var y: Float
+        /// Camera-relative depth (larger = farther), used for the rasterizer's z-test.
+        var depth: Float
+    }
+
     /// Projects a world-space point to viewport pixel coordinates plus a
-    /// camera-relative depth (larger = farther), or `nil` if the point is behind
-    /// or too close to the camera to project meaningfully.
-    func project(_ point: Vector3, viewportWidth: Float, viewportHeight: Float) -> (x: Float, y: Float, depth: Float)? {
+    /// camera-relative depth, or `nil` if the point is behind or too close to the
+    /// camera to project meaningfully.
+    ///
+    /// - Note: There is no near-plane clipping — a triangle with any vertex that
+    ///   fails to project is dropped whole by the caller. Fine for the typical
+    ///   case of a camera orbiting outside a part/model's bounding sphere; a
+    ///   triangle straddling the camera itself will simply vanish.
+    func project(_ point: Vector3, viewportWidth: Float, viewportHeight: Float) -> ProjectedPoint? {
         let forward = (target - eye).normalized
         let right = forward.cross(up).normalized
         let trueUp = right.cross(forward)
@@ -62,6 +74,6 @@ struct LDrawCamera {
         let pixelX = (ndcX * 0.5 + 0.5) * viewportWidth
         let pixelY = (1 - (ndcY * 0.5 + 0.5)) * viewportHeight
 
-        return (pixelX, pixelY, viewZ)
+        return ProjectedPoint(x: pixelX, y: pixelY, depth: viewZ)
     }
 }

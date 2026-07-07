@@ -10,11 +10,13 @@ import Musl
 import Darwin
 #endif
 
-/// A minimal interactive 3D LDraw viewer built on SDL3's 2D renderer: world-space
-/// triangles are projected with a software perspective camera, depth-sorted
-/// back-to-front (a painter's algorithm — SDL's 2D renderer has no depth buffer),
-/// flat-shaded with a single directional light, and rasterized via
-/// `SDLRenderer.drawGeometry`. Edge lines (LDraw line types 2/5) are not drawn yet.
+/// A minimal interactive 3D LDraw viewer built on SDL3: world-space triangles are
+/// rasterized by `LDrawSoftwareRasterizer` (a CPU rasterizer with a real per-pixel
+/// depth buffer — SDL's 2D renderer has none of its own) into an RGBA8 buffer,
+/// shaded with a two-light-plus-ambient model, then uploaded to a streaming
+/// `SDLTexture` and blitted full-window each frame.
+///
+/// Edge lines (LDraw line types 2/5) are not drawn yet.
 public struct LDrawSDLViewer {
 
     public struct Options: Sendable {
@@ -22,20 +24,42 @@ public struct LDrawSDLViewer {
         public var windowSize: (width: Int, height: Int)
         public var backgroundColor: (red: UInt8, green: UInt8, blue: UInt8)
         public var autoRotate: Bool
-        public var lightDirection: Vector3
+        public var ambientIntensity: Float
+        public var keyLightDirection: Vector3
+        public var keyLightIntensity: Float
+        public var fillLightDirection: Vector3
+        public var fillLightIntensity: Float
 
         public init(
             windowTitle: String = "LDraw Viewer",
             windowSize: (width: Int, height: Int) = (1024, 768),
             backgroundColor: (red: UInt8, green: UInt8, blue: UInt8) = (245, 245, 245),
             autoRotate: Bool = true,
-            lightDirection: Vector3 = Vector3(x: -0.4, y: -0.8, z: -0.4).normalized
+            ambientIntensity: Float = 0.4,
+            keyLightDirection: Vector3 = Vector3(x: -0.4, y: -0.8, z: -0.4).normalized,
+            keyLightIntensity: Float = 0.65,
+            fillLightDirection: Vector3 = Vector3(x: 0.5, y: 0.15, z: 0.55).normalized,
+            fillLightIntensity: Float = 0.3
         ) {
             self.windowTitle = windowTitle
             self.windowSize = windowSize
             self.backgroundColor = backgroundColor
             self.autoRotate = autoRotate
-            self.lightDirection = lightDirection
+            self.ambientIntensity = ambientIntensity
+            self.keyLightDirection = keyLightDirection
+            self.keyLightIntensity = keyLightIntensity
+            self.fillLightDirection = fillLightDirection
+            self.fillLightIntensity = fillLightIntensity
+        }
+
+        var lighting: LDrawSoftwareRasterizer.Lighting {
+            .init(
+                ambientIntensity: ambientIntensity,
+                keyLightDirection: keyLightDirection,
+                keyLightIntensity: keyLightIntensity,
+                fillLightDirection: fillLightDirection,
+                fillLightIntensity: fillLightIntensity
+            )
         }
     }
 
@@ -59,6 +83,9 @@ public struct LDrawSDLViewer {
             options: [.resizable, .highPixelDensity]
         )
         let renderer = try SDLRenderer(window: window)
+        let rasterizer = LDrawSoftwareRasterizer()
+        var frameTexture: SDLTexture?
+        var frameTextureSize: (width: Int, height: Int) = (0, 0)
 
         let target = triangles.boundsCenter
         let distance = triangles.boundsRadius * 2.8
@@ -114,59 +141,64 @@ public struct LDrawSDLViewer {
             )
             let camera = LDrawCamera(eye: eye, target: target)
 
-            try drawFrame(camera: camera, window: window, renderer: renderer)
+            try drawFrame(
+                camera: camera, window: window, renderer: renderer, rasterizer: rasterizer,
+                frameTexture: &frameTexture, frameTextureSize: &frameTextureSize
+            )
         }
     }
 
-    private func drawFrame(camera: LDrawCamera, window: SDLWindow, renderer: SDLRenderer) throws(SDLError) {
+    private func drawFrame(
+        camera: LDrawCamera,
+        window: SDLWindow,
+        renderer: SDLRenderer,
+        rasterizer: LDrawSoftwareRasterizer,
+        frameTexture: inout SDLTexture?,
+        frameTextureSize: inout (width: Int, height: Int)
+    ) throws(SDLError) {
         let size = window.drawableSize
-        let width = Float(size.width)
-        let height = Float(size.height)
+        guard size.width > 0, size.height > 0 else { return }
 
-        struct ProjectedTriangle {
-            var points: [(x: Float, y: Float)]
-            var depth: Float
-            var color: SDLRenderer.VertexColor
-        }
+        rasterizer.render(
+            triangles: triangles,
+            camera: camera,
+            width: size.width,
+            height: size.height,
+            backgroundColor: options.backgroundColor,
+            lighting: options.lighting
+        )
 
-        var projected: [ProjectedTriangle] = []
-        projected.reserveCapacity(triangles.count)
-
-        for triangle in triangles {
-            guard
-                let p1 = camera.project(triangle.vertex1, viewportWidth: width, viewportHeight: height),
-                let p2 = camera.project(triangle.vertex2, viewportWidth: width, viewportHeight: height),
-                let p3 = camera.project(triangle.vertex3, viewportWidth: width, viewportHeight: height)
-            else { continue }
-
-            let lightAmount = max(0.3, triangle.normal.dot(-options.lightDirection))
-            let color = SDLRenderer.VertexColor(
-                red: Float(triangle.color.red) / 255 * lightAmount,
-                green: Float(triangle.color.green) / 255 * lightAmount,
-                blue: Float(triangle.color.blue) / 255 * lightAmount,
-                alpha: Float(triangle.color.alpha) / 255
+        if frameTexture == nil || frameTextureSize.width != size.width || frameTextureSize.height != size.height {
+            frameTexture = try SDLTexture(
+                renderer: renderer,
+                format: SDLPixelFormat.Format(rawValue: SDL_PIXELFORMAT_RGBA8888.rawValue),
+                access: .streaming,
+                width: size.width,
+                height: size.height
             )
-            let depth = (p1.depth + p2.depth + p3.depth) / 3
-            projected.append(ProjectedTriangle(points: [(p1.x, p1.y), (p2.x, p2.y), (p3.x, p3.y)], depth: depth, color: color))
+            try frameTexture?.setScaleMode(.nearest)
+            frameTextureSize = size
         }
 
-        // Painter's algorithm: draw farthest triangles first so nearer ones overdraw them.
-        projected.sort { $0.depth > $1.depth }
+        guard let texture = frameTexture else { return }
 
-        try renderer.setDrawColor(red: options.backgroundColor.red, green: options.backgroundColor.green, blue: options.backgroundColor.blue)
-        try renderer.clear()
-
-        if !projected.isEmpty {
-            var vertices: [(position: SDL_FPoint, color: SDLRenderer.VertexColor)] = []
-            vertices.reserveCapacity(projected.count * 3)
-            for triangle in projected {
-                for point in triangle.points {
-                    vertices.append((SDL_FPoint(x: point.x, y: point.y), triangle.color))
+        let colorBuffer = rasterizer.colorBuffer
+        let rowBytes = size.width * 4
+        colorBuffer.withUnsafeBytes { source in
+            _ = try? texture.withUnsafeMutableBytes { destination, pitch in
+                if pitch == rowBytes {
+                    destination.copyMemory(from: source.baseAddress!, byteCount: source.count)
+                } else {
+                    for row in 0..<size.height {
+                        let sourceRow = source.baseAddress!.advanced(by: row * rowBytes)
+                        let destinationRow = destination.advanced(by: row * pitch)
+                        destinationRow.copyMemory(from: sourceRow, byteCount: rowBytes)
+                    }
                 }
             }
-            try renderer.drawGeometry(vertices: vertices)
         }
 
+        try renderer.copy(texture, destination: SDL_FRect(x: 0, y: 0, w: Float(size.width), h: Float(size.height)))
         renderer.present()
     }
 }
