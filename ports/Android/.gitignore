@@ -1,0 +1,5 @@
+.build/
+AndroidApp/app/build/
+AndroidApp/.gradle/
+AndroidApp/app/src/main/jniLibs/
+AndroidApp/build/

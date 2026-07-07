@@ -1,0 +1,6 @@
+module CJNI [system] {
+    header "shim.h"
+    link "android" // ANativeWindow_fromSurface/_release (<android/native_window*.h>)
+    link "log"      // __android_log_write (<android/log.h>)
+    export *
+}

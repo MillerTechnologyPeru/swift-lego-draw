@@ -1,0 +1,27 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'org.ldraw.vulkantest'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'org.ldraw.vulkantest'
+        // Matches the Swift build's android28 triple (ports/Android/Makefile API_LEVEL).
+        minSdk 28
+        targetSdk 36
+        versionCode 1
+        versionName '0.0.1'
+    }
+
+    sourceSets {
+        main {
+            // Populated by `make jnilibs` (this package's .so + Swift runtime).
+            jniLibs.srcDirs = ['src/main/jniLibs']
+            // The bundled LDraw test model (2x4 brick + its primitives) — see
+            // src/main/assets/ldraw/. Extracted to internal storage by MainActivity before the
+            // native test runs, since the NDK's AAssetManager API isn't a plain filesystem path.
+        }
+    }
+}
