@@ -1,3 +1,4 @@
+#if canImport(Metal)
 let LDrawMSLSource = """
 #include <metal_stdlib>
 using namespace metal;
@@ -43,3 +44,4 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) {
     return float4(rgb, in.color.a);
 }
 """
+#endif

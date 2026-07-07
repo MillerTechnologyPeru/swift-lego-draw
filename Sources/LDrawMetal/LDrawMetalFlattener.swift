@@ -1,3 +1,4 @@
+#if canImport(Metal)
 import simd
 import LegoDrawFile
 
@@ -133,3 +134,4 @@ private extension float4x4 {
         ))
     }
 }
+#endif

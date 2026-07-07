@@ -12,6 +12,7 @@ let package = Package(
         .library(name: "LegoDrawFile", targets: ["LegoDrawFile"]),
         .library(name: "LDrawSceneKit", targets: ["LDrawSceneKit"]),
         .library(name: "LDrawMetal", targets: ["LDrawMetal"]),
+        .library(name: "LDrawGLES", targets: ["LDrawGLES"]),
     ],
     targets: [
         .target(
@@ -26,6 +27,17 @@ let package = Package(
         .target(
             name: "LDrawMetal",
             dependencies: ["LegoDrawFile"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .systemLibrary(name: "CGLES2"),
+        .systemLibrary(name: "CEGL"),
+        .target(
+            name: "LDrawGLES",
+            dependencies: [
+                "LegoDrawFile",
+                .target(name: "CGLES2", condition: .when(platforms: [.linux])),
+                .target(name: "CEGL", condition: .when(platforms: [.linux])),
+            ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .executableTarget(
