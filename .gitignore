@@ -63,3 +63,7 @@ fastlane/test_output
 
 # Finder
 .DS_Store
+
+# VS Code
+.vscode
+.claude
