@@ -34,8 +34,12 @@ public struct LDrawVulkanFlattener {
         for child in model.children {
             switch child {
             case .subfile(let t, let colorRef, let invertWinding, let sub):
+                // Apply the subfile's own local transform `t` first (child-local -> parent-local),
+                // then the already-accumulated `transform` (parent-local -> world) — i.e. compose
+                // as `t` then `transform`, which per `multiplied(by:)`'s "self first, then other"
+                // convention is `t.multiplied(by: transform)`.
                 visit(sub,
-                      transform: transform.multiplied(by: t),
+                      transform: t.multiplied(by: transform),
                       inheritedColor: resolve(colorRef, current: inheritedColor),
                       ccw: invertWinding ? !ccw : ccw,
                       &out)
