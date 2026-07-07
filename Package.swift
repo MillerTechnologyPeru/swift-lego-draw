@@ -22,6 +22,11 @@ let package = Package(
             dependencies: ["LegoDrawFile"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .executableTarget(
+            name: "RenderLDrawModel",
+            dependencies: ["LDrawSceneKit"],
+            path: "Examples/RenderLDrawModel"
+        ),
         .testTarget(
             name: "LegoDrawFileTests",
             dependencies: ["LegoDrawFile"],
