@@ -1,0 +1,15 @@
+{
+  "originHash" : "ae1ffe749d82e43036ff0e884e792550dbe972fee39783577833a45aab6cd831",
+  "pins" : [
+    {
+      "identity" : "sdl",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/PureSwift/SDL.git",
+      "state" : {
+        "revision" : "7d2a624c6881925d845052501817f630b13da623",
+        "version" : "3.1.0"
+      }
+    }
+  ],
+  "version" : 3
+}

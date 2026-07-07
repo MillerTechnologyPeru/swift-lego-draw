@@ -11,6 +11,10 @@ let package = Package(
     products: [
         .library(name: "LegoDrawFile", targets: ["LegoDrawFile"]),
         .library(name: "LDrawSceneKit", targets: ["LDrawSceneKit"]),
+        .library(name: "LDrawSDL", targets: ["LDrawSDL"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/PureSwift/SDL.git", from: "3.1.0"),
     ],
     targets: [
         .target(
@@ -22,10 +26,23 @@ let package = Package(
             dependencies: ["LegoDrawFile"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .target(
+            name: "LDrawSDL",
+            dependencies: [
+                "LegoDrawFile",
+                .product(name: "SDL3Swift", package: "SDL"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .executableTarget(
             name: "RenderLDrawModel",
             dependencies: ["LDrawSceneKit"],
             path: "Examples/RenderLDrawModel"
+        ),
+        .executableTarget(
+            name: "SDLLDrawViewer",
+            dependencies: ["LDrawSDL"],
+            path: "Examples/SDLLDrawViewer"
         ),
         .testTarget(
             name: "LegoDrawFileTests",
